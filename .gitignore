@@ -15,7 +15,6 @@ evaluate_results/
 
 # ai coding
 .codex/
-.claude/
 
 # Data types
 *.jit
@@ -265,10 +264,10 @@ benchmark_results.jsonl
 media/*.pdf
 media/*.mp4
 
-# Claude Code working files — local assistant context, not project source.
-CLAUDE.md
-**/CLAUDE.md
-**/.claude/
+# Claude Code — the repo's committed context (root CLAUDE.md + .claude/context/)
+# is tracked on purpose. Only local, machine-specific assistant state is ignored.
+.claude/settings.local.json
+**/.claude/settings.local.json
 
 # Downloaded checkpoints for local eval (12GB+ each) — never commit.
 ckpts/
