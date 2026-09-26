@@ -215,5 +215,8 @@ sampling the off-diagonal pairs (s, t) (`flow_map.time_sampling`, flowmap_core):
   jump size uniform instead of uniform-by-area (jumps > 0.9: ~10% of pairs instead of 1%).
 
 Deviation: **LSD starts from the task release**, not AGIBOT (unavailable); label it so.
+EMA: one decay, **0.995** (not the 0.9999 preselected above for long training): with a fixed
+decay and no warm-up, 0.9999 would still hold 82% of the starting FM weights after 2,000
+updates. Evaluate the 0.995 EMA and the raw weights.
 Settings shared in `configs/flowmap_robotwin_study.yaml`; run directories
 `runs/flowmap_fulljoint/robotwin_{lmd,lsd}_{grid,curriculum}_s42_20260926`.

@@ -2,7 +2,7 @@
 # sampling, 2000 updates of 192 (mb2 x 24 x 4 GPUs). Shared settings mirror
 # flowmap_libero_lmd_full except the data; each arm config sets objective + sampling.
 # Fast path: latent cache, fused TVM attention JVP, microbatch 2, background EMA.
-# Storage: weights every 500 (raw + EMA 0.9999, ~24 GB each), one resumable state.
+# Storage: weights every 500 (raw + EMA 0.995, ~24 GB each), one resumable state.
 defaults:
   - flowmap_robotwin_base
   - _self_
@@ -44,7 +44,10 @@ data:
 model:
   flow_map:
     jvp_attention: tvm
-    ema_decays: [0.9999]
+    # One EMA sized for a 2,000-update run: horizon ~200 updates, the initial (FM) weights
+    # keep 8% at update 500 and ~0 at 2000. The study's 0.9999 suits 400k+ step training;
+    # here it would still be 82% the starting model at the end.
+    ema_decays: [0.995]
     dt_method: ad
     detach_derivatives: false
     strip_width: 1.0
