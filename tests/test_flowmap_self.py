@@ -287,3 +287,70 @@ def test_scheduled_and_grid_time_sampling_in_training_loss():
     assert float((seen['s'] - seen['t']).max()) <= 0.25 + 1e-6 and metrics['time_max_jump'] == 0.25
     model._flowmap_update = 1500
     assert training_loss(model, batch(b=2))[1]['time_max_jump'] == 1.0
+
+
+def test_trainer_passes_update_to_wrapped_model():
+    """Under DeepSpeed the trainer holds an engine that forwards training_loss to the
+    FlexPi module but keeps attribute writes to itself: the update must reach the module."""
+    from contextlib import contextmanager, nullcontext
+    from flexpi.trainer import Wan22Trainer
+
+    class Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.))
+            self.flow_map = FlowMapConfig(enabled=True, objective='lmd', strip_width_start=.25,
+                                          strip_anneal_updates=10)
+            self.seen = []
+        def training_loss(self, sample):
+            self.seen.append(self._flowmap_update)
+            return self.weight.square(), {}
+
+    class Engine(nn.Module):                      # DeepSpeedEngine-like: forwards reads only
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
+
+    class Accelerator:
+        num_processes, process_index, is_main_process, count = 1, 0, True, 0
+        @contextmanager
+        def accumulate(self, model):
+            self.count += 1
+            self.sync_gradients = self.count % 4 == 0
+            self.optimizer_step_was_skipped = False
+            yield
+        def unwrap_model(self, model): return model.module
+        def autocast(self): return nullcontext()
+        def backward(self, loss): (loss / 4).backward()
+        def gather(self, value): return value
+        def clip_grad_norm_(self, parameters, limit):
+            return torch.nn.utils.clip_grad_norm_(parameters, limit)
+
+    inner = Inner()
+    trainer = Wan22Trainer.__new__(Wan22Trainer)
+    trainer.model = Engine(inner)
+    trainer.accelerator = Accelerator()
+    trainer.flowmap_ema = None
+    trainer._flowmap_microstep = 0
+    trainer.optimizer = torch.optim.SGD(inner.parameters(), lr=0.)
+    trainer.scheduler = torch.optim.lr_scheduler.LambdaLR(trainer.optimizer, lambda _: 1.)
+    trainer._set_dit_only_train_mode = lambda: None
+    trainer._estimate_eta = lambda: ('00:00:00', 1.)
+    trainer.save_checkpoint = lambda: dict(weights_path=None, state_path='mock-state')
+    trainer.global_step = trainer.epoch = trainer.batch_in_epoch = 0
+    trainer.max_steps = 2
+    trainer.eval_every = trainer.save_every = trainer.log_every = 0
+    trainer.batch_size, trainer.gradient_accumulation_steps, trainer.seed = 1, 4, 42
+    trainer.max_grad_norm = 1.
+    trainer.train_sampler = None
+    trainer.train_loader = [{'action': torch.zeros(1, 1, 1)} for _ in range(8)]
+    trainer._wandb_log = lambda _: None
+    with tempfile.TemporaryDirectory() as folder:
+        trainer.output_dir = trainer.weights_dir = folder
+        trainer.train()
+    assert inner.seen == [0] * 4 + [1] * 4

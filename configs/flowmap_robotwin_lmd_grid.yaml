@@ -13,6 +13,7 @@ model:
     lmd_teacher_gradient: full
     distill_ema: true
     distill_learned_time_weighting: false
-    teacher_checkpoint: ${pretrained_ckpt}
+    # Explicit, not ${pretrained_ckpt}: resumes override pretrained_ckpt=null.
+    teacher_checkpoint: ./checkpoints/released/flexpi-robotwin/checkpoints/weights/step_048060.pt
     time_sampling: inference_grid
     grid_steps: [1, 2]

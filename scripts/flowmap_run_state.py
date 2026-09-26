@@ -10,6 +10,16 @@ def latest_state(root):
     return states[-1].parent if states else None
 
 
+def ema_decays(root):
+    """The run's exported EMA decays (its frozen config), default (0.999, 0.9999)."""
+    config = root/'prepared_config.yaml'
+    if not config.is_file():
+        return (.999, .9999)
+    from omegaconf import OmegaConf
+    decays = OmegaConf.select(OmegaConf.load(config), 'model.flow_map.ema_decays')
+    return tuple(float(d) for d in decays) if decays is not None else (.999, .9999)
+
+
 def validate_segment(root, initial_step=0, minimum_bytes=1_000_000_000):
     status=json.loads((root/'segment_status.json').read_text())
     step=int(status['step']); horizon=int(status['max_steps'])
@@ -30,7 +40,7 @@ def validate_segment(root, initial_step=0, minimum_bytes=1_000_000_000):
         if not path.is_file() or not path.stat().st_size:
             raise ValueError(f'Missing full training state: {path}')
     required=[root/f'checkpoints/weights/step_{step:06d}.pt', state/'flowmap_ema.pt']
-    required += [root/f'checkpoints/weights/ema_{d}/step_{step:06d}.pt' for d in (.999,.9999)]
+    required += [root/f'checkpoints/weights/ema_{d}/step_{step:06d}.pt' for d in ema_decays(root)]
     for path in required:
         if not path.is_file() or path.stat().st_size < minimum_bytes:
             raise ValueError(f'Missing/incomplete checkpoint: {path}')

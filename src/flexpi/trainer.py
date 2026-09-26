@@ -1873,7 +1873,9 @@ class Wan22Trainer:
 
                 flow = getattr(train_model, "flow_map", None)
                 if flow is not None and flow.enabled:
-                    train_model._flowmap_update = self.global_step   # scheduled time sampling
+                    # On the FlexPi module itself: under DeepSpeed train_model is the engine,
+                    # which forwards training_loss but not attribute writes.
+                    self.accelerator.unwrap_model(self.model)._flowmap_update = self.global_step
                 if flow is not None and flow.enabled and flow.self_distillation:
                     from .models.helpers.flowmap_self import update_diagonal_mask
                     if sample['action'].shape[0] != self.batch_size:
