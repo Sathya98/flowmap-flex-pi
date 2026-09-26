@@ -22,6 +22,9 @@ flow_map block, so one model load serves every mode.
 
     python scripts/profile_flowmap_step.py --config-name flowmap_libero_lmd_full \\
         --cache data/latent_cache/libero_fulljoint_v2 --out runs/diagnostics/profile_x
+
+--fingerprint tvm,explicit runs only a refactor fingerprint (loss, grad norm, grad hash
+per --modes x backend, --repeats times) for .claude/context/08-flowmap-core-plan.md.
 """
 import argparse
 import dataclasses
@@ -338,6 +341,45 @@ def profile_step(model, base_flow, batch, name, out_dir):
 
 # ----------------------------------------------------------------------------- main
 
+def fingerprint(model, base_flow, batches, modes, backends, repeats):
+    """Loss, grad norm and a hash over all grads per (mode, backend), repeated to expose
+    run-to-run spread; compared before and after refactors (08-flowmap-core-plan.md)."""
+    import hashlib
+    from flexpi.models.helpers.attention import set_jvp_attention_backend
+    out = {}
+    for backend in backends:
+        set_jvp_attention_backend(backend)
+        for name in modes:
+            torch.manual_seed(0)                      # a TimeLossWeight created here is seeded
+            diag = set_mode(model, base_flow, name)
+            runs = []
+            for _ in range(repeats):
+                model.zero_grad(set_to_none=True)
+                torch.manual_seed(0)
+                torch.cuda.manual_seed_all(0)
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    loss, metrics = model.training_loss(with_mask(batches[0], diag))
+                loss.backward()
+                sync()
+                digest, norm = hashlib.sha256(), 0.0
+                for n, p in model.named_parameters():
+                    if p.grad is not None:
+                        g = p.grad.detach()
+                        digest.update(n.encode() + g.contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes())
+                        norm += float(g.double().square().sum())
+                runs.append(dict(loss=float(loss), grad_norm=math.sqrt(norm), grad_sha=digest.hexdigest()[:16],
+                                 metrics={k: float(v) for k, v in metrics.items()
+                                          if isinstance(v, (int, float)) or torch.is_tensor(v) and v.numel() == 1}))
+                log(f"  fingerprint {backend:8s} {name:10s} loss {runs[-1]['loss']!r} "
+                    f"grad_norm {runs[-1]['grad_norm']!r} sha {runs[-1]['grad_sha']}")
+                del loss
+            out[f"{name}/{backend}"] = runs
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+    model.flow_map = base_flow
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config-name", default="flowmap_libero_lmd_full")
@@ -350,6 +392,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--skip", default="", help="comma list of inputs,attention,step,profile")
+    parser.add_argument("--fingerprint", default="",
+                        help="comma list of jvp_attention backends: only run the refactor fingerprint "
+                             "(--modes, batch 1, --repeats times each)")
     args, overrides = parser.parse_known_args()
     skip = set(filter(None, args.skip.split(",")))
     modes = [m for m in args.modes.split(",") if m]
@@ -386,6 +431,12 @@ def main():
     def save():
         (out_dir / "results.json").write_text(json.dumps(results, indent=2) + "\n")
 
+    if args.fingerprint:
+        log(f"fingerprint: modes {modes}, backends {args.fingerprint}, repeats {args.repeats}")
+        results["fingerprint"] = fingerprint(model, base_flow, batches, modes,
+                                             args.fingerprint.split(","), args.repeats)
+        save()
+        skip = {"inputs", "attention", "step", "profile"}
     if "inputs" not in skip:
         log("inputs: raw decode + frozen encoders vs latent cache (median per example)")
         results["inputs"] = time_inputs(model, raw, cached, positions[:args.input_samples], windows)

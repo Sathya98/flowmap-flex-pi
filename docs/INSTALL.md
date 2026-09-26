@@ -25,6 +25,8 @@ conda create -n flexpi python=3.10 -y
 conda activate flexpi
 
 pip install -e . --extra-index-url https://download.pytorch.org/whl/cu128
+# The flow-map code lives in the in-repo package flowmap_core (not on PyPI).
+pip install --no-deps -e flowmap_core
 
 # torchcodec from PyPI, not the cu128 index.
 pip install --force-reinstall --no-deps \
@@ -57,6 +59,7 @@ source .venv/bin/activate
 
 UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128 \
   uv pip install --index-strategy unsafe-best-match -e .
+uv pip install --no-deps -e flowmap_core   # in-repo flow-map package
 
 uv pip install --reinstall --no-deps \
   --index-url https://pypi.org/simple torchcodec==0.5
@@ -84,8 +87,10 @@ RUN conda install -y -c conda-forge 'ffmpeg=7' && conda clean -afy
 WORKDIR /workspace/flex-pi
 COPY pyproject.toml ./
 COPY src ./src
+COPY flowmap_core ./flowmap_core
 RUN pip install --no-cache-dir -e . \
       --extra-index-url https://download.pytorch.org/whl/cu128
+RUN pip install --no-cache-dir --no-deps -e flowmap_core
 RUN pip install --no-cache-dir --force-reinstall --no-deps \
       --index-url https://pypi.org/simple torchcodec==0.5
 

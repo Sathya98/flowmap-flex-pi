@@ -23,6 +23,10 @@ models/
     dino.py            DINO RoPE freqs, frame-slot selection, x0→v conversion          ← 01
     gradient.py        gradient_checkpoint_forward
     loader.py, io.py, state_dict_converters.py   weight loading / conversion
+    flowmap.py         FlowMapConfig (FlexPi fields) over flowmap_core.flowmap         ← 05
+    flowmap_training.py, flowmap_diagnostics.py, adaptation.py   flow-map loss/tuning  ← 05
+    attention.py, checkpoint.py, normalization.py, flowmap_self.py, jvp_attention/
+                       ALIASES of flowmap_core modules (sys.modules shims; see §1b)
   inference_opt/       TensorRT + CUDA-graph + step-skip engines (joint path only)     ← §3
 datasets/lerobot/      the data pipeline (RobotVideoDataset, processors, transforms)   ← 03
 composite_layouts.py   LayoutSpec / Slot registry                                      ← 03
@@ -33,6 +37,22 @@ vis.py, utils/         viz, config resolvers, samplers, video IO/metrics, loggin
 ```
 
 Cross-references (`← NN`) point to the `.claude/context/` doc with the detail.
+
+## 1b. `flowmap_core/` — shared flow-map package (in-repo, editable-installed)
+
+Model-agnostic flow-map training code, extracted so the Wan2.2 world model
+(`../exmachina/diffsynth-studio`) can reuse it (`docs/wm_wan_extension.md` §6,
+`.claude/context/08-flowmap-core-plan.md`). `src/flowmap_core/`: `flowmap`
+(`FlowMapObjectiveConfig`, `map_residuals`, time sampling, JVP helpers), `flowmap_self`
+(diagonal mask, `slice_batch`, `TimeLossWeight`), `attention` + `jvp_attention/` (forward-AD
+SDPA, fused TVM JVP kernels, CC BY-NC-SA 4.0), `checkpoint`, `normalization`, `ema`
+(`EvaluationEMA`), `step_profile`, `deepspeed_compat`, `latent_store` (`ArrayStore`), `graphs` (`CapturedStep`, whole-microstep
+CUDA graphs; harness `scripts/cuda_graph_step.py`).
+Old FlexPi paths are `sys.modules` aliases: `flexpi.models.helpers.{attention,checkpoint,
+normalization,flowmap_self,jvp_attention}`, `flexpi.utils.{flowmap_ema,step_profile,
+deepspeed_compat}` *are* the core modules (patch either name). Core-only tests:
+`pytest flowmap_core/tests` (FlexPi import blocked by its conftest). Install:
+`uv pip install --no-deps -e flowmap_core` (done in `fm_env`).
 
 ## 2. Evaluation — `experiments/` + `scripts/eval_*.sh`
 
@@ -84,7 +104,8 @@ wire contract + emergency-stop rules are in `docs/YAM.md`.
 Python ≥3.10, CUDA 12.8. Core: `torch==2.7.1+cu128`, `torchvision`, `torchcodec==0.5`,
 `decord2==3.3.0` (imports as `decord`; the depth/AV1 fast path), `accelerate==1.12.0`,
 `deepspeed==0.18.9`, `transformers==4.49.0`, `timm==1.0.26` (DINOv3), `hydra-core==1.3.2`,
-`av==16.0.1`, `huggingface-hub==0.29.2`, `wandb`. Extras:
+`av==16.0.1`, `huggingface-hub==0.29.2`, `wandb`, and the in-repo `flowmap-core`
+(editable install of `./flowmap_core`, not on PyPI). Extras:
 - `.[libero]` — `mujoco==3.3.2` (pin is load-bearing: 3.8.0 shifts libero_object OOD),
   `bddl`, `gym`; **`robosuite==1.4.0` installed separately with `--no-deps`**.
 - `.[serve]` — `msgpack`, `websockets`, `osqp`, `scipy` (YAM server).

@@ -29,7 +29,8 @@ are future ablations. The general AGIBOT checkpoint must be acquired separately.
 
 Porting the flow-map stack (LSD/LMD, latent cache, batching, EMA, kernels) to the
 Wan2.2-TI2V-5B **world model** in `../exmachina/diffsynth-studio`: see
-[docs/wm_wan_extension.md](docs/wm_wan_extension.md) (plan; nothing ported yet).
+[docs/wm_wan_extension.md](docs/wm_wan_extension.md). Phase 1 (the shared `flowmap_core/` package,
+FlexPi bit-identical through module aliases) is done; the WM port itself has not started.
 
 ## 📚 Context docs (read these on demand)
 
@@ -45,7 +46,8 @@ before relying on it (the tree moves).
 | [`03-dataloaders.md`](.claude/context/03-dataloaders.md) | The LeRobot data pipeline: `RobotVideoDataset` → `FlexPiProcessor`, the sample dict, the 33→9→3 temporal cascade, depth codecs, the composite-layout/slot system, action/rotation transforms, camera intrinsics, the T5 text cache. |
 | [`04-repo-map.md`](.claude/context/04-repo-map.md) | File-by-file map, eval/deploy entry points, dependencies, and the external services this involves (HuggingFace downloads, SLURM, Wan2.2/DINOv3/DA3 weights). |
 | [`05-flowmap-conversion.md`](.claude/context/05-flowmap-conversion.md) | The conversion working notes: what "flow map" means here, the surgical insertion points across the heads and the step loop, open questions. |
-| [`07-efficiency-notes.md`](.claude/context/07-efficiency-notes.md) | Training cost of the flow-map objectives: measured s/update and memory (PFMM, LMD), why LMD's forward AD costs memory, LSD/ESD vs LMD JVP/gradient structure, estimated timings, the self-distillation mask imbalance, the forward-AD attention path, the 1-GPU profiling benchmark (`scripts/profile_flowmap_step.py`) and its results, the trainer-timing harness (`FLEXPI_STEP_TIMING`) and the DeepSpeed ZeRO-2 hook bug it found (patched in `utils/deepspeed_compat.py`), the TVM fused attention-JVP validation and integration (`jvp_kernel_analysis/`), the microstep profile and CUDA-graph/compile plan and the background EMA fix (§11), the per-update timeline from baseline to now (§12), and the TODO list. |
+| [`07-efficiency-notes.md`](.claude/context/07-efficiency-notes.md) | Training cost of the flow-map objectives: measured s/update and memory (PFMM, LMD), why LMD's forward AD costs memory, LSD/ESD vs LMD JVP/gradient structure, estimated timings, the self-distillation mask imbalance, the forward-AD attention path, the 1-GPU profiling benchmark (`scripts/profile_flowmap_step.py`) and its results, the trainer-timing harness (`FLEXPI_STEP_TIMING`) and the DeepSpeed ZeRO-2 hook bug it found (patched in `flowmap_core.deepspeed_compat`), the TVM fused attention-JVP validation and integration (`jvp_kernel_analysis/`), the microstep profile and CUDA-graph/compile plan and the background EMA fix (§11), the per-update timeline from baseline to now (§12), whole-microstep CUDA graphs measured and what blocks torch.compile (§13), the plan for cutting GPU compute (§14), and the TODO list. |
+| [`08-flowmap-core-plan.md`](.claude/context/08-flowmap-core-plan.md) | **Done (S0–S7).** Extracting the model-agnostic flow-map code (objective math, diagonal mask, forward-AD attention/TVM, checkpoint, EMA, profiler, latent-cache storage) into the shared `flowmap_core/` package, with FlexPi kept bit-identical via module aliases. Decisions, steps S0–S7 with gates, pitfalls, progress log with every equivalence result. Read before changing `flowmap_core/` or its FlexPi aliases. |
 
 ## 🗺️ Architecture at a glance
 

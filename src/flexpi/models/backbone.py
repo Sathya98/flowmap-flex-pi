@@ -931,7 +931,8 @@ class FlexPiBackbone(torch.nn.Module):
             vae_indices[i]
             for i in select_aux_frame_slots(num_latent, aux_temporal_stride, keep_far)
         ]
-        return image_is_pad[:, aux_indices]
+        # Column-by-column: a list index would build a host index tensor and copy it (a sync).
+        return torch.stack([image_is_pad[:, i] for i in aux_indices], dim=1)
 
     @staticmethod
     def _masked_loss_reduction(

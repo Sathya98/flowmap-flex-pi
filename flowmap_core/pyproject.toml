@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowmap-core"
+version = "0.1.0"
+description = "Model-agnostic flow-map training for DiT flow-matching models: objectives, diagonal mask, forward-AD attention and fused JVP kernels, EMA, profiling, latent storage"
+requires-python = ">=3.10"
+# torch is the only hard dependency; triton (fused JVP kernels), deepspeed
+# (deepspeed_compat) and numpy (latent_store) are imported where used.
+dependencies = ["torch>=2.7"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"flowmap_core.jvp_attention.tvm" = ["LICENSE-TVM", "SOURCE.md"]

@@ -578,6 +578,19 @@ class WanVideoDiT(torch.nn.Module):
         )
         return t + (self.time_embedding_delta(delta_emb) - self.time_embedding_delta(zero_emb.to(emb_dtype)))
 
+    def _rope_freqs(self, f, h, w, device):
+        """3-D RoPE table for an f×h×w token grid on ``device``; memoized, as the host-side
+        table would otherwise be rebuilt and copied (a sync) on every forward."""
+        cache = self.__dict__.setdefault("_rope_freqs_cache", {})
+        key = (f, h, w, str(device))
+        if key not in cache:
+            cache[key] = torch.cat([
+                self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ], dim=-1).reshape(f * h * w, 1, -1).to(device)
+        return cache[key]
+
     def pre_dit(
         self,
         x: torch.Tensor,
@@ -686,11 +699,7 @@ class WanVideoDiT(torch.nn.Module):
 
         x_tokens = x.permute(0, 2, 3, 4, 1).reshape(x.shape[0], -1, x.shape[1]).contiguous()
 
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
+        freqs = self._rope_freqs(f, h, w, x_tokens.device)
 
         return {
             "tokens": x_tokens,

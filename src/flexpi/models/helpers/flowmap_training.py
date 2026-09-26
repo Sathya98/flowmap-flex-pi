@@ -1,9 +1,29 @@
 """FlexPi's joint flow-map objective; encoders and padding conventions are reused."""
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import torch
 
 from .flowmap_self import slice_batch
 from .flowmap import STREAMS, affine_flow_map, map_residuals, sample_level_pair_strip
+
+
+_DEFER_METRICS = False
+
+
+@contextmanager
+def deferred_metrics():
+    """Loss metrics stay 0-d GPU tensors instead of Python floats: no host sync
+    (needed inside CUDA-graph capture; read them after the step)."""
+    global _DEFER_METRICS
+    previous, _DEFER_METRICS = _DEFER_METRICS, True
+    try:
+        yield
+    finally:
+        _DEFER_METRICS = previous
+
+
+def _metric(value):
+    value = value.detach().mean()
+    return value if _DEFER_METRICS else float(value)
 
 
 def predict_streams(model, state, s, t, context, context_mask, fuse, active):
@@ -142,7 +162,7 @@ def training_loss(model, sample, tiled=False, *, times=None, noise=None,
                                       sampling=cfg.time_sampling)
     else:
         s, t = (a.to(device=clean['action'].device, dtype=torch.float32) for a in times)
-        if s.shape != (b,) or t.shape != (b,) or not bool(
+        if s.shape != (b,) or t.shape != (b,) or not (s.is_cuda and torch.cuda.is_current_stream_capturing()) and not bool(
                 (torch.isfinite(s) & torch.isfinite(t) & (s > 0) & (s <= 1) &
                  (t >= 0) & (t <= s) & (s-t <= cfg.strip_width + 1e-6)).all()):
             raise ValueError('Diagnostic times require batch-shaped 0 <= t <= s <= 1 within the strip')
@@ -214,16 +234,16 @@ def training_loss(model, sample, tiled=False, *, times=None, noise=None,
                         if diagonal is not None else off.new_zeros(()))
                 weight = getattr(model, 'loss_lambda_' + name)
                 total = total + weight * (cfg.map_weight * off + diagonal_weight * diag)
-                metrics['loss_flowmap_' + name] = float(off.detach().mean())
-                metrics['loss_diagonal_' + name] = float(diag.detach().mean())
+                metrics['loss_flowmap_' + name] = _metric(off)
+                metrics['loss_diagonal_' + name] = _metric(diag)
             if cfg.self_distillation or cfg.uses_time_weighting:
-                metrics['loss_unweighted'] = float(total.detach().mean())
+                metrics['loss_unweighted'] = _metric(total)
                 if cfg.self_distillation:
                     metrics['self_diagonal_fraction'] = float(_self_term == 'diagonal')
                 if cfg.uses_time_weighting:
                     logvar = model.flow_map_loss_weight(s, t)
                     total = logvar.neg().exp() * total + logvar
-                    metrics['time_logvar'] = float(logvar.detach().mean())
+                    metrics['time_logvar'] = _metric(logvar)
             return total, metrics
     finally:
         if teacher is not None:

@@ -83,8 +83,8 @@ class ResidualSensitivityProbe:
                              'experiments/libero/eval_libero_single.py',
                              'scripts/summarize_residual_sensitivity.py',
                              'src/flexpi/models/flexpi.py',
-                             'src/flexpi/models/helpers/attention.py',
-                             'src/flexpi/models/helpers/normalization.py'):
+                             'flowmap_core/src/flowmap_core/attention.py',
+                             'flowmap_core/src/flowmap_core/normalization.py'):
                 content = (root / relative).read_bytes()
                 target = self.path.parent / 'source_snapshot' / relative
                 target.parent.mkdir(parents=True, exist_ok=True)

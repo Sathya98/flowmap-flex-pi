@@ -1,7 +1,7 @@
 # Fused attention-JVP kernels: which one fits us
 
 > **Status (2026-09-26): TVM kernel integrated behind `flow_map.jvp_attention: tvm`**
-> (`src/flexpi/models/helpers/jvp_attention/`, license accepted for now; default stays
+> (`flowmap_core/src/flowmap_core/jvp_attention/`, aliased as `flexpi.models.helpers.jvp_attention`; license accepted for now; default stays
 > `explicit`). Validation results: `.claude/context/07-efficiency-notes.md` §10.
 > `fused_attention_jvp.py` here is now a shim re-exporting the shipped code.
 

@@ -86,7 +86,7 @@ flow_map:
   time_sampling: uniform_triangle  # Boffi uniform-area proposal; conditional is an ablation
   dt_method: auto             # exact JVP; FD requires float32
   detach_derivatives: false   # true: lower-memory expanded semigradient variant
-  jvp_attention: explicit     # tvm: fused Triton attention JVP (helpers/jvp_attention)
+  jvp_attention: explicit     # tvm: fused Triton attention JVP (flowmap_core.jvp_attention)
   fd_eps: 1.0e-4
 
 video_dit_config:

@@ -35,6 +35,13 @@ must distinguish inherited teacher training from additional distillation cost.
 
 ## Objectives
 
+Code: the model-agnostic objective math, diagonal mask, forward-AD attention/TVM kernels,
+checkpointing, EMA and profiling live in the shared package `flowmap_core/`
+(its README lists the modules). The FlexPi paths (`flexpi.models.helpers.attention`,
+`...flowmap_self`, `flexpi.utils.flowmap_ema`, ...) are aliases of those modules;
+`flexpi.models.helpers.flowmap` adds FlexPi's `FlowMapConfig` fields and
+`helpers/flowmap_training.py` the per-stream losses.
+
 All times are sigma noise levels (1=noise, 0=clean). The map is
 `X(s,t,x) = x + (t-s) v(x,s,t)`. The identity boundary is exact. Every generated
 stream moves along a **shared sigma schedule**, including teacher queries and
@@ -92,7 +99,7 @@ fully differentiable. Dual-number attention has two backends
 - `explicit` (default) uses out-of-place FP32 math, including softmax, to support
   backward through the temporal JVP on PyTorch 2.7. Its attention memory is quadratic.
 - `tvm` uses fused Triton kernels from Terminal Velocity Matching
-  (`src/flexpi/models/helpers/jvp_attention`, CC BY-NC-SA 4.0) that compute
+  (`flowmap_core.jvp_attention`, CC BY-NC-SA 4.0) that compute
   attention, its JVP, and the backward through both without materialising L×L.
   Masks are split exactly into mask-free row groups (3 in full joint).
   Measured per call it is 3.8× faster and uses ~10× less memory; per LMD/LSD step it
@@ -100,7 +107,7 @@ fully differentiable. Dual-number attention has two backends
   `explicit` at cosine 0.99997.
 
 Ordinary forwards retain fused SDPA. Attention inside JVP forwards is checkpointed
-with the dual-aware `helpers/checkpoint.py`.
+with the dual-aware `flowmap_core.checkpoint`.
 Profile real hardware before selecting a full-scale batch size.
 
 External LMD additionally supports `lmd_teacher_gradient=full`, retaining the

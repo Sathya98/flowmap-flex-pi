@@ -28,18 +28,22 @@ episode. Layout (a few large ``.npy`` files, memory-mapped on read):
 Encoder outputs are stored as bf16 (its int16 bit pattern; numpy has no
 bfloat16) and cast back on read to the dtype ``build_inputs`` produced
 (``source_dtype``): DINO comes out float32 under autocast, and the noise and
-targets built from it must keep that dtype. The proprio
+targets built from it must keep that dtype. The generic store (sparse preallocation, memory maps, dtype round trip) is
+``flowmap_core.latent_store.ArrayStore``; ``LatentCache`` adds the DINO row layout. The proprio
 token is NOT cached: ``proprio_encoder`` is trainable, so ``build_inputs_from_cache``
 appends it at train time exactly like ``build_inputs``.
 """
 import hashlib
-import json
 from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+
+from flowmap_core.latent_store import (  # noqa: F401  (re-exported for FlexPi callers)
+    NP_DTYPES as _NP_DTYPES, ArrayStore, fingerprint_diff, from_numpy, load, select_windows, to_numpy,
+)
 
 CACHE_VERSION = 2
 PROMPT_BYTES = 512
@@ -53,8 +57,6 @@ _ENCODER_MODEL_KEYS = (
     "dino_stride_keep_far", "dino_pool_mode", "dino_pixel_unshuffle", "dino_pool_factor",
     "enable_pointmap", "pointmap_norm_bounds", "pointmap_max_depth_m",
 )
-_NP_DTYPES = {torch.bfloat16: np.int16, torch.float32: np.float32, torch.bool: np.bool_,
-              torch.int64: np.int64, torch.int32: np.int32, torch.float16: np.float16}
 # Index arrays saved beside the manifest, fully written at init.
 _INDEX_ARRAYS = ("windows", "dino_rows", "dino_row_index", "dino_writer", "dino_row_owner")
 
@@ -75,16 +77,6 @@ def encoder_fingerprint(cfg) -> dict:
     }
 
 
-def fingerprint_diff(a, b, prefix=""):
-    """Dotted paths at which two fingerprints differ."""
-    if isinstance(a, dict) and isinstance(b, dict):
-        out = []
-        for k in sorted(set(a) | set(b), key=str):
-            out += fingerprint_diff(a.get(k), b.get(k), f"{prefix}{k}.")
-        return out
-    return [] if a == b else [prefix.rstrip(".")]
-
-
 def dino_frame_offsets(video_sample_indices, temporal_stride, keep_far, global_sample_stride):
     """Raw-frame offset (from the window start) of every DINO frame in a window.
 
@@ -96,12 +88,6 @@ def dino_frame_offsets(video_sample_indices, temporal_stride, keep_far, global_s
     aligned = [min(4 * i, T - 1) for i in range((T - 1) // 4 + 1)]
     slots = select_aux_frame_slots(len(aligned), temporal_stride, keep_far=keep_far)
     return [int(video_sample_indices[aligned[s]]) * int(global_sample_stride) for s in slots]
-
-
-def select_windows(episode_from, episode_to, stride):
-    """Window starts at every ``stride``-th frame of each episode (all frames at 1)."""
-    return np.concatenate([np.arange(a, b, stride, dtype=np.int64)
-                           for a, b in zip(np.asarray(episode_from), np.asarray(episode_to))])
 
 
 def window_frames(windows, episode_to, offsets):
@@ -125,62 +111,16 @@ def dino_row_plan(frames):
     return rows, row_index, writer.reshape(frames.shape), first // frames.shape[1]
 
 
-def to_numpy(t: torch.Tensor) -> np.ndarray:
-    t = t.detach().cpu()
-    if t.dtype == torch.bfloat16:
-        return t.view(torch.int16).numpy()
-    return t.numpy()
-
-
-def from_numpy(a: np.ndarray, dtype: str, source_dtype: str = None) -> torch.Tensor:
-    t = torch.from_numpy(np.array(a))   # copy out of the read-only memmap
-    if dtype == "bfloat16":
-        t = t.view(torch.bfloat16)
-    return t if source_dtype in (None, dtype) else t.to(getattr(torch, source_dtype))
-
-
-def load(spec, a) -> torch.Tensor:
-    return from_numpy(a, spec["dtype"], spec.get("source_dtype"))
-
-
-class LatentCache:
-    """Array store. ``create`` preallocates (sparse), ``open`` memory-maps."""
-
-    def __init__(self, root, manifest):
-        self.root, self.manifest, self._arrays = Path(root), manifest, {}
+class LatentCache(ArrayStore):
+    """FlexPi's cache: per-window latents plus DINO rows shared between windows."""
+    VERSION = CACHE_VERSION
+    INDEX_ARRAYS = _INDEX_ARRAYS
 
     @classmethod
     def create(cls, root, manifest, index):
         """``index`` holds the ``_INDEX_ARRAYS``; the data arrays start empty."""
-        root = Path(root)
-        root.mkdir(parents=True, exist_ok=True)
         lengths = {"window": manifest["num_windows"], "dino": manifest["num_dino_rows"]}
-        for name, spec in manifest["arrays"].items():
-            np.lib.format.open_memmap(root / f"{name}.npy", mode="w+", dtype=np.dtype(spec["np_dtype"]),
-                                      shape=(lengths[spec["rows"]], *spec["shape"])).flush()
-        for name in _INDEX_ARRAYS:
-            np.save(root / f"{name}.npy", index[name])
-        np.lib.format.open_memmap(root / "done.npy", mode="w+", dtype=np.uint8,
-                                  shape=(manifest["num_windows"],)).flush()
-        (root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        return cls(root, manifest)
-
-    @classmethod
-    def open(cls, root):
-        root = Path(root)
-        manifest = json.loads((root / "manifest.json").read_text())
-        if manifest.get("version") != CACHE_VERSION:
-            raise ValueError(f"{root}: cache version {manifest.get('version')} != {CACHE_VERSION}")
-        return cls(root, manifest)
-
-    def array(self, name, mode="r"):
-        key = (name, mode)
-        if key not in self._arrays:
-            self._arrays[key] = np.load(self.root / f"{name}.npy", mmap_mode=mode)
-        return self._arrays[key]
-
-    def done(self, mode="r"):
-        return self.array("done", mode)
+        return super().create(root, manifest, index, lengths)
 
     def dino_const(self):
         if "_dino_const" not in self._arrays:

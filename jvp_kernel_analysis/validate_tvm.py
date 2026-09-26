@@ -42,7 +42,7 @@ spec = importlib.util.spec_from_file_location("profile_step", REPO / "scripts" /
 prof = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prof)
 from flexpi.models import wan_video_dit  # noqa: E402
-from flexpi.models.helpers.attention import scaled_dot_product_attention as explicit_sdpa  # noqa: E402
+from flowmap_core.attention import scaled_dot_product_attention as explicit_sdpa  # noqa: E402
 
 log, GiB = prof.log, 2 ** 30
 ORIGINAL_SDPA = wan_video_dit.scaled_dot_product_attention
@@ -81,7 +81,7 @@ def reference_jvp(q, k, v, tq, tk, tv, mask):
 
 
 def explicit_jvp(q, k, v, tq, tk, tv, mask):
-    """The production path: helpers/attention.py under forward AD (explicit FP32)."""
+    """The production path: flowmap_core.attention under forward AD (explicit FP32)."""
     with fw.dual_level():
         out = explicit_sdpa(*(fw.make_dual(p, t) for p, t in zip((q, k, v), (tq, tk, tv))), attn_mask=mask)
         o, to = fw.unpack_dual(out)

@@ -387,11 +387,19 @@ class FlexPi(FlexPiBackbone):
             out["stride_keep_far"] = True
         return out
 
+    def _glue_cache_active(self):
+        if getattr(self, "_glue_cache_train", False):
+            if not hasattr(self, "_glue_cache"):
+                self._glue_cache = {}
+            return True
+        return getattr(self, "_glue_cache_enabled", False) and not self.training
+
     def _glue_memo(self, key, build):
         """Memoize per-call-constant inference glue (see ``glue_cache`` in
         ``prepare_for_inference``). Bypassed unless the knob is on AND the
-        model is in eval mode; hits are bit-identical (pure shape functions)."""
-        if not (getattr(self, "_glue_cache_enabled", False) and not self.training):
+        model is in eval mode, or ``_glue_cache_train`` is set (training, e.g.
+        CUDA-graph capture); hits are bit-identical (pure shape functions)."""
+        if not self._glue_cache_active():
             return build()
         hit = self._glue_cache.get(key)
         if hit is None:
@@ -2857,7 +2865,7 @@ class FlexPi(FlexPiBackbone):
     ) -> torch.Tensor:
         bf = getattr(self, "_batch_flex", None)
         cache_key = None
-        if bf is None and getattr(self, "_glue_cache_enabled", False) and not self.training:
+        if bf is None and self._glue_cache_active():
             # Inference mask is a pure function of shapes + device + the
             # runtime regime bits below (cm_* are per-instance config, fixed
             # for the cache's lifetime — prepare_for_inference resets it).

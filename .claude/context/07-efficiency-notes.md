@@ -4,6 +4,14 @@
 > of the flow-map objectives, so the profiling work can pick up from here. Written
 > 2026-09-23 from the LIBERO slurm logs and run dirs. **Not profiled yet** — anything marked
 > *estimate* is a cost-model inference, not a measurement. Line numbers are a snapshot.
+>
+> **Paths (2026-09-26):** the generic modules named below moved to the shared package
+> `flowmap_core/` (`.claude/context/08-flowmap-core-plan.md`). `helpers/attention.py`,
+> `helpers/jvp_attention/`, `helpers/checkpoint.py`, `helpers/normalization.py`,
+> `helpers/flowmap_self.py`, `utils/flowmap_ema.py`, `utils/step_profile.py` and
+> `utils/deepspeed_compat.py` are now aliases of `flowmap_core.{attention, jvp_attention,
+> checkpoint, normalization, flowmap_self, ema, step_profile, deepspeed_compat}`. Timings are
+> unchanged (S6 in the 08 progress log).
 
 ---
 
@@ -198,6 +206,17 @@ Open, roughly in order:
 - [x] Post-update cost found and fixed (§11): the rank-0 CPU EMA (~9 s/update). Flat chunked
       background fold: post 0.2 s; LSD update ~38.5 → ~30 s, LMD ~81 → ~72 s (mb2, TVM).
 - [ ] The first EMA fold after startup takes ~30 s (one-time, unexplained).
+- [x] CUDA graphs measured (§13): 2.2× at mb1, 1.2–1.3× at mb2 (GPU-bound); trainer integration
+      needs a capture-compatible gradient reduce (not ZeRO-2 hooks).
+- [ ] Cut GPU time: investigation plan in §14 (profile graphed replay, attribute kernels,
+      casts, GEMM efficiency, recompute share, then choose the fusion route).
+- [ ] `cache_latents.py verify` on `libero_fulljoint_v2` now fails the 1e-3 VAE tolerance
+      (input_latents 5.6e-3, first_frame 8.8e-3, pointmap 4.6e-3; dino 1.1e-2 vs 1.7e-3 then). It
+      passed at exactly 0 right after encoding (job 27165239, 2026-09-21). Identical numbers at
+      `8d00d25` and after the flowmap_core refactor (jobs 27211483, 27211278), so something between
+      the encode and now changed the fresh VAE/DINO encode (or it is nondeterministic across
+      runs). bf16-rounding scale; decide whether the cache is still "the same inputs" before
+      comparing cached and uncached runs.
 - [ ] Remove host syncs from the loss/metrics path (~50 per microstep; minor).
 - [ ] ESD 4-GPU timing (LSD is job 27183027).
 - [ ] Multi-interval PFMM batch-192 timing (only one interval exists).
@@ -854,3 +873,115 @@ Against measured LSD at row 2 (the first time LSD ran at scale): 67 s → 30 s, 
   bring a microstep to ~0.6 s *est.* (~4–5×).
 - One-time ~30 s first EMA fold per segment (unexplained); flex TVM slowdown; ~50 host syncs per
   microstep.
+
+
+## 13. CUDA graphs: whole-microstep capture measured (1 H100, 2026-09-26)
+
+**Forward vs backward idle, from the step-0 trace** (job 27200222, LMD mb1 TVM, one profiled
+microstep; the profiler inflates CPU time ~1.5×; split by thread, forward = main thread until the
+autograd thread starts):
+
+| Phase | wall | GPU busy | CPU ops | kernels |
+|---|---|---|---|---|
+| forward (student JVP + teacher) | 1782 ms | 294 ms (**16%**) | 177k | 25k |
+| backward (incl. checkpoint recompute) | 2576 ms | 887 ms (34%) | 360k | 56k |
+
+At mb2: forward 21% busy, backward 38%. The forward is the most launch-bound part.
+
+**What made the step capturable** (all bit-identical in eager; CPU suite + fingerprint unchanged):
+- `flowmap_core.graphs.CapturedStep`: side-stream warmup, capture of loss + backward, replay;
+  gradients accumulate into the existing `.grad`. `guard()`/`keep_alive()`/`check()` for frozen
+  content-dependent decisions. Test: `flowmap_core/tests/test_core_graphs.py` (GPU; tiny DiT
+  LMD/LSD replay bit-identical to eager, accumulation too).
+- `flowmap_core.jvp_attention`: at capture, a mask that misses the plan cache (FlexPi's
+  cross-attention key masks, rebuilt each forward) reuses the latest same-shape eager plan, with a
+  device-side equality guard (`CapturedStep.check()` raises if a replay saw a different mask).
+- `flowmap_core.checkpoint`: `preserve_rng_state=False` only while capturing (the checkpointed
+  attention is RNG-free; get_rng_state is illegal in capture).
+- FlexPi: `model._glue_cache_train = True` memoizes shape-only masks/freqs in training too (so
+  TVM plans hit by tensor identity); `flowmap_training.deferred_metrics()` keeps loss metrics as
+  GPU tensors; RoPE tables cached on device (`wan_video_dit._rope_freqs`, `action_dit`: was 4 host
+  copies + syncs per forward); `_aux_per_frame_is_pad` without a list index (was a sync).
+- Remaining host syncs in a capture-ready eager step: 0 (explicit) / 2 eager-only plan lookups (TVM).
+
+**Results** (`scripts/cuda_graph_step.py`; jobs 27216144 tvm mb1, 27216145 explicit mb1,
+27216146 tvm mb2; full-joint LIBERO, 1 H100, no DeepSpeed):
+
+| Mode | mb | eager | graph | speedup | graph reserved |
+|---|---|---|---|---|---|
+| LMD full, TVM | 1 | 2.476 s | **1.138 s** | 2.18× | 63.0 GiB |
+| LSD off-diagonal, TVM | 1 | 2.362 s | **1.038 s** | 2.27× | 61.3 GiB |
+| LSD diagonal, TVM | 1 | 0.527 s | **0.273 s** | 1.93× | 45.4 GiB |
+| LMD full, explicit | 1 | 2.681 s | 1.547 s | 1.73× | 71.6 GiB |
+| LSD off, explicit | 1 | 2.485 s | 1.447 s | 1.72× | 71.2 GiB |
+| LMD full, TVM | 2 | 2.679 s | 2.110 s | 1.27× | 88.2 GiB |
+| LSD off, TVM | 2 | 2.511 s | 1.890 s | 1.33× | 85.3 GiB |
+| LSD diagonal, TVM | 2 | 0.587 s | 0.499 s | 1.18× | 53.7 GiB |
+
+Correctness: losses bit-identical in every mode. With `explicit` attention, graph gradients are
+bit-identical to eager (1 step and 2-step accumulation, all modes; one earlier run, 27216090, saw
+6.8e-3 on LMD 2-step once). With TVM, graph-vs-eager per-tensor differences (worst tensor
+1.7–4.2% rel L2) are the size of eager-vs-eager with the same seed (2.0–6.7%): TVM's atomics, not
+the graph. (Worst-tensor metric; the global grad-norm spread is ~4e-7, §S0 of 08.)
+
+**What it means:**
+- A graph brings the microstep down to about its GPU-busy time. At mb1 that is 2.2× — the
+  launch overhead measured in step 0.
+- **At mb2 the graph is already GPU-bound**: 2.11 s for 2 LMD examples = 1.05 s/example, the
+  same as mb1 graphed (1.14 s). Production already runs mb2 eager (1.34 s/example LMD, 1.26 LSD
+  off on 1 GPU), which hides half the launch cost. Graph over *production*: ~1.2× per example.
+- Memory: mb2 graphed needs 88 GiB on 1 GPU before ZeRO state (+~12 GiB) → does not fit at
+  4-GPU ZeRO-2. mb1 graphed (63 GiB) does.
+- Projected update (48 examples/GPU; 1-GPU compute only, no comm): LMD mb2 eager 64 s (72 s
+  measured at 4 GPUs) → mb1 graphed ~55 s; LSD 26 s (30 s measured) → ~22 s. **~1.2–1.3×**, not
+  the 2.4× the mb1 profile suggested.
+- The GPU time is now the cost: ~1.05 s/example against a ~0.3 s FLOP estimate; step 0 put 57%
+  of it in unfused elementwise/copy/norm kernels (tangent formulas, casts). Fusion is the lever.
+- torch.compile cannot trace forward-AD duals on torch 2.7.1 (checked: dynamo "Nested forward mode
+  AD is not supported"; inductor's compiled Function has no JVP rule). It applies only to dual-free
+  parts (LSD diagonal branch, the LMD teacher query) or after the explicit-tangent rewrite.
+- Not yet in the trainer: ZeRO-2 reduces gradients from Python hooks during backward, which
+  cannot be captured. Options: in-graph NCCL reduce-scatter of a flat grad buffer + own sharded
+  AdamW (a small ZeRO-2 of our own), or ZeRO-1/DDP-no-sync style with one reduce per update.
+
+
+## 14. Next: understanding and cutting the GPU compute (plan, not started)
+
+After graphs (§13) a microstep costs its GPU time: ~1.05–1.14 s per LMD example (1 H100),
+against a ~0.3 s FLOP estimate (§11). Step 0 attributed 57% of GPU time to unfused
+elementwise/copy/norm kernels (64k kernels, median 3.5 µs). Before changing code, find out
+*which* model code produces that time. Steps, in order:
+
+1. **Profile a graphed replay** (`scripts/cuda_graph_step.py` + torch.profiler around
+   `graph.replay()`, or nsys with `--cuda-graph-trace=node`): pure GPU time with no launch gaps.
+   Report kernel categories as in step 0, at mb1 and mb2, for LMD full, LSD off and LSD diagonal.
+2. **Attribute kernels to model regions.** Add `torch.profiler.record_function` (or NVTX) ranges
+   around: student primal+tangent forward, teacher forward, backward, checkpoint recompute; and
+   inside a DiT block: adaLN modulation, norm, q/k/v + RoPE, attention, output proj, FFN, residual.
+   Profile eagerly (ranges are CPU-side; the graph replay has none) and map kernel time per range.
+3. **Casts and copies.** `aten::copy_` was 34k calls / 146 ms and `_to_copy` 12k per microstep.
+   List where they come from (per call site, via `record_shapes`/stack): suspects are
+   `ForwardADLayerNorm`'s FP32 round trip, the explicit attention's FP32 path (TVM leaves some
+   casts), `.float()` in `predict_streams`/loss, RoPE in FP32/complex, autocast re-casts of weights
+   under forward AD. Each removable cast pair is two kernels ×(forward, tangent, backward).
+4. **GEMM efficiency.** GEMM+attention were ~0.44 s vs ~0.3 s FLOP-ideal. Check achieved
+   TFLOP/s per GEMM shape (≈1,640 tokens × 3072 at mb1: skinny); mb2 or stacking primal and
+   tangent (`[x; tx]` in one GEMM, the explicit-tangent idea) doubles M.
+5. **Checkpoint recompute share.** The mixed-attention checkpoint recomputes attention forward +
+   JVP in the backward. With TVM, memory at mb1 graphed is 63 GiB (+~12 GiB ZeRO): measure the
+   step with `mot_checkpoint_mixed_attn=false` if it fits.
+6. **Decide the fusion route** from the numbers:
+   - cheap: delete redundant casts/copies; fuse adaLN modulate+norm (+tangent) with a small Triton
+     kernel; TF32 where FP32 math remains;
+   - torch.compile on the dual-free parts (LSD diagonal branch = 75% of LSD microsteps; LMD teacher
+     query), which works on torch 2.7.1;
+   - explicit tangent blocks (`(x, tx) → (y, ty)` with plain ops) + torch.compile for the JVP
+     forward (§11, 1–2 weeks); first check whether torch 2.11 (`diff_env`) compiles forward-AD
+     duals, which would avoid the rewrite.
+7. **Then integrate graphs in the trainer** (§13: needs a capture-compatible gradient reduce
+   instead of ZeRO-2's hooks). Graphs matter more once GPU time falls, since launch overhead is
+   then again the larger share.
+
+Tools already in place: `flowmap_core.step_profile` (trace summary, sync sites), the trace
+phase split in §13, `scripts/profile_flowmap_step.py`, `scripts/cuda_graph_step.py`,
+`FLEXPI_STEP_PROFILE_*` in the trainer.

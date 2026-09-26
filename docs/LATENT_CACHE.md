@@ -6,7 +6,8 @@ Motivation: the ~13 s/example floor in `.claude/context/07-efficiency-notes.md`
 is shared by every objective and contains data decoding plus the frozen VAE and
 DINO encoders.
 
-Code: `src/flexpi/datasets/latent_cache.py` (format, reader, `build_inputs_from_cache`),
+Code: `src/flexpi/datasets/latent_cache.py` (FlexPi layout, reader, `build_inputs_from_cache`) on
+top of the generic store `flowmap_core.latent_store.ArrayStore` (memory maps, sparse preallocation, bf16 round trip),
 `scripts/cache_latents.py` (init / encode / verify), `scripts/slurm/cache_latents.sbatch`,
 `tests/test_latent_cache.py`.
 

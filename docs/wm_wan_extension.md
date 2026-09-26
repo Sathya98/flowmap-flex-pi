@@ -164,6 +164,22 @@ LSD's 75/25 mixture wants a larger batch (FlexPi uses 192).
 
 ## 6. Extracting `flowmap_core` (phase 1 in detail)
 
+Step-by-step implementation plan and progress log: `.claude/context/08-flowmap-core-plan.md`.
+
+> **Status (2026-09-26): phase 1 done.** `flowmap_core/` exists in this repo (README lists the
+> API) and is editable-installed in `fm_env`. The old FlexPi paths are `sys.modules` aliases of
+> the core modules, not `import *` re-exports (so monkeypatches and module globals still work).
+> Verified: FlexPi CPU suite unchanged, CPU fingerprint bit-identical, GPU `lmd_full`/`lsd_off`
+> bit-identical with `explicit` attention and within run-to-run spread with `tvm`,
+> 28 core-only tests with FlexPi unimportable (including a tiny generic DiT trained with all
+> seven objectives). Deviations from the text below:
+> - the latent-cache split moved a generic `latent_store.ArrayStore` to the core; FlexPi's
+>   `LatentCache` (DINO row layout) subclasses it;
+> - `teacher_checkpoint` went to the core config (any distillation needs it);
+> - FlexPi's `pyproject.toml` notes the in-repo package instead of listing it (it isn't on
+>   PyPI; `docs/INSTALL.md` installs it).
+> Details and numbers: `.claude/context/08-flowmap-core-plan.md` progress log.
+
 Checked 2026-09-26 against the FlexPi tree. The move is behaviour-preserving: the core modules
 are the files FlexPi runs today, moved, with FlexPi importing them back.
 

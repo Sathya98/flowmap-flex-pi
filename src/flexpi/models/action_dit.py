@@ -344,7 +344,11 @@ class ActionDiT(nn.Module):
         tokens = self.action_encoder(action_tokens)
         context_emb = self.text_embedding(context)
         context_attn_mask = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
-        freqs = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
+        cache = self.__dict__.setdefault("_rope_freqs_cache", {})   # host table: avoid a copy per forward
+        key = (seq_len, str(tokens.device))
+        if key not in cache:
+            cache[key] = self.freqs[:seq_len].view(seq_len, 1, -1).to(tokens.device)
+        freqs = cache[key]
 
         return {
             "tokens": tokens,

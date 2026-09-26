@@ -113,7 +113,7 @@ def main():
         offset+=count
     cases=make_cases(len(samples),args.random_pairs)
     source_paths = [Path(__file__).resolve(),
-        root/'src/flexpi/models/helpers/flowmap.py',
+        root/'src/flexpi/models/helpers/flowmap.py', root/'flowmap_core/src/flowmap_core/flowmap.py',
         root/'src/flexpi/models/helpers/flowmap_training.py',
         root/'src/flexpi/models/helpers/flowmap_diagnostics.py',
         root/'src/flexpi/models/helpers/dino.py', root/'src/flexpi/models/flexpi.py']

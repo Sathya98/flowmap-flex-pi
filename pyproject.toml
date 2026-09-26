@@ -7,6 +7,8 @@ name = "flexpi"
 version = "0.1.0"
 description = "FlexPi: standalone Wan2.2-TI2V-5B training/inference package"
 requires-python = ">=3.10"
+# Also requires the in-repo flow-map package: `pip install --no-deps -e flowmap_core`
+# (not on PyPI, so not listed; docs/INSTALL.md).
 dependencies = [
   "accelerate==1.12.0",
   "av==16.0.1",
