@@ -1,4 +1,4 @@
-"""CPU checks for LIBERO pilots initialized from the task-finetuned release."""
+"""CPU checks for flow-map runs (LIBERO or RoboTwin) initialized from the task-finetuned release."""
 import ast
 import argparse
 import hashlib
@@ -31,11 +31,20 @@ def main():
     saved = OmegaConf.load(saved_path)
     current = OmegaConf.to_container(cfg.model, resolve=True)
     old = OmegaConf.to_container(saved.model, resolve=True)
+    # Activation checkpointing is a runtime memory setting, not architecture.
+    for model_cfg in (current, old):
+        for key in ('video_dit_config', 'action_dit_config'):
+            model_cfg[key].pop('use_gradient_checkpointing', None)
     # Compare the actual release architecture, not just the task-config name.
     for key in ('video_dit_config', 'action_dit_config', 'proprio_dim', 'hbridge',
                 'composite_layout', 'composite_layout_slot_key_map', 'dino_dim',
                 'dino_pixel_unshuffle', 'dino_temporal_stride', 'dino_pred_x0',
                 'pointmap_norm_bounds'):
+        if key not in old:
+            # The RoboTwin release config omits its legacy geometry keys; the run config
+            # pins them explicitly (flowmap_robotwin_base.yaml header).
+            print(f'Release config omits {key}; run pins {current.get(key)!r}')
+            continue
         if current[key] != old[key]:
             raise ValueError(f'Teacher/student configuration mismatch: {key}')
     count = 0
@@ -52,23 +61,29 @@ def main():
                 raise FileNotFoundError(dataset / 'meta' / name)
         if not (dataset / 'data').is_dir() or not (dataset / 'videos').is_dir():
             raise FileNotFoundError(f'Missing data/videos directory: {dataset}')
+        text_dir = resolve(cfg.data.train.text_embedding_cache_dir)
+        # Sharded release (RoboTwin: ~1M prompts): keys in manifest.txt (text_embed_shards.py).
+        sharded = (text_dir / 'manifest.txt').is_file() and (text_dir / 'shards').is_dir()
+        keys = set((text_dir / 'manifest.txt').read_text().split()) if sharded else None
         for line in (dataset / 'meta/tasks.jsonl').read_text().splitlines():
             prompt = template.format(task=json.loads(line)['task'])
             digest = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
-            cache = resolve(cfg.data.train.text_embedding_cache_dir) / (
-                f'{digest}.t5_len{cfg.data.train.context_len}.wan22ti2v5b.pt')
-            if not cache.is_file():
-                raise FileNotFoundError(f'Missing text cache for {prompt!r}: {cache}')
+            cache = text_dir / f'{digest}.t5_len{cfg.data.train.context_len}.wan22ti2v5b.pt'
+            if not (digest in keys if sharded else cache.is_file()):
+                raise FileNotFoundError(f'Missing text cache for {prompt!r}: {text_dir if sharded else cache}')
             count += 1
     assert cfg.model.flow_map.enabled
-    assert cfg.model.flow_map.objective in ('pfmm', 'lmd')
+    assert cfg.model.flow_map.objective in ('pfmm', 'lmd', 'emd', 'lsd', 'esd', 'psd_m', 'psd_u')
+    if cfg.model.flow_map.objective in ('lsd', 'esd', 'psd_m', 'psd_u'):
+        assert cfg.model.flow_map.teacher_checkpoint is None, 'Self-distillation must not load a teacher'
     if cfg.model.flow_map.objective == 'lmd':
         assert cfg.model.flow_map.teacher_checkpoint == cfg.pretrained_ckpt
         assert cfg.model.flow_map.dt_method == 'ad'
         assert not cfg.model.flow_map.detach_derivatives
     assert set(cfg.model.flow_map.streams) == {'action', 'video', 'dino', 'pointmap'}
     assert cfg.model.flow_map.mode == 'full' and not cfg.model.flex_joint.enabled
-    print(f'Preflight passed: released initialization, matching architecture, {count} task text caches, four data suites.')
+    print(f'Preflight passed: released initialization, matching architecture, {count} task text caches, '
+          f'{len(cfg.data.train.dataset_dirs)} dataset dir(s).')
     print(f'Objective={cfg.model.flow_map.objective}, time_sampling={cfg.model.flow_map.time_sampling}, strip_width={cfg.model.flow_map.strip_width}')
     print('This does not validate every video, checkpoint tensor, CUDA/DeepSpeed execution, or GPU memory fit.')
 

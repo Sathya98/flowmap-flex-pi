@@ -9,7 +9,8 @@ import math
 
 from flowmap_core.flowmap import (  # noqa: F401  (re-exported for FlexPi callers)
     FlowMapObjectiveConfig, MapFn, affine_flow_map, delta_timestep, dX_dt_finite_difference,
-    dX_dt_forward_ad, lmd_residual, map_residuals, sample_level_pair_strip, tuple_jvp,
+    dX_dt_forward_ad, lmd_residual, map_residuals, sample_inference_grid_pairs, sample_level_pair_strip,
+    training_time_pairs, tuple_jvp,
 )
 
 STREAMS = ("video", "dino", "pointmap", "action")

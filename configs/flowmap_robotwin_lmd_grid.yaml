@@ -1,0 +1,18 @@
+# RoboTwin LMD, grid time sampling (see flowmap_robotwin_study.yaml).
+# Off-diagonal pairs are exactly the 1-step and 2-step sampling maps, 50/50, all run:
+# 1-jump s=1, t~U[0,1]; 2-jump s in {1, 0.5}, t~U[s-0.5, s].
+defaults:
+  - flowmap_robotwin_study
+  - _self_
+wandb:
+  name: robotwin-lmd-grid-s42
+  group: robotwin-lmd
+model:
+  flow_map:
+    objective: lmd
+    lmd_teacher_gradient: full
+    distill_ema: true
+    distill_learned_time_weighting: false
+    teacher_checkpoint: ${pretrained_ckpt}
+    time_sampling: inference_grid
+    grid_steps: [1, 2]

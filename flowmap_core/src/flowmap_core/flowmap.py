@@ -14,6 +14,7 @@ from typing import Callable, Optional, Tuple
 import torch
 
 MapFn = Callable[[torch.Tensor], torch.Tensor]
+TIME_SAMPLINGS = ("uniform_triangle", "uniform_jump", "inference_grid", "conditional")
 
 
 @dataclass
@@ -35,8 +36,19 @@ class FlowMapObjectiveConfig:
     teacher_steps: int = 4
     schedule_shift: float = 1.0
     num_inference_steps: int = 2
-    strip_width: float = 1.0
-    time_sampling: str = "uniform_triangle"  # conditional retained for ablations
+    strip_width: float = 1.0  # maximum jump s - t (the final one, under a schedule)
+    # Off-diagonal (s, t) sampling. uniform_triangle: uniform area (jump density ∝ 1 - h);
+    # uniform_jump: jump size uniform, then source uniform; inference_grid: exactly the maps
+    # K-step sampling uses, K drawn from grid_steps (source = a grid node, t along that
+    # segment); conditional: legacy ablation.
+    time_sampling: str = "uniform_triangle"
+    grid_steps: tuple = (1, 2)
+    # Curriculum (optimizer-update schedule; None/0 = off): the maximum jump grows linearly
+    # from strip_width_start to strip_width over strip_anneal_updates, and from
+    # uniform_jump_from_update on the sampling switches to uniform_jump.
+    strip_width_start: Optional[float] = None
+    strip_anneal_updates: int = 0
+    uniform_jump_from_update: Optional[int] = None
     dt_method: str = "auto"  # auto/ad: exact JVP; FD only for float32 models
     detach_derivatives: bool = False  # optional lower-memory semigradient variant
     # Attention under forward AD: "explicit" materialises L×L in FP32; "tvm" uses the
@@ -59,8 +71,24 @@ class FlowMapObjectiveConfig:
             raise ValueError("pfmm_loss_space must be velocity or endpoint")
         if self.objective not in ("lmd", "emd", "pfmm", "lsd", "esd", "psd_m", "psd_u"):
             raise ValueError(f"Unknown flow_map.objective: {self.objective}")
-        if self.time_sampling not in ("uniform_triangle", "conditional"):
+        if self.time_sampling not in TIME_SAMPLINGS:
             raise ValueError(f"Unknown time_sampling: {self.time_sampling}")
+        self.grid_steps = tuple(int(k) for k in self.grid_steps)
+        if not self.grid_steps or len(set(self.grid_steps)) != len(self.grid_steps) or min(self.grid_steps) < 1:
+            raise ValueError("grid_steps must be unique positive step counts")
+        if self.strip_width_start is not None and not 0 < self.strip_width_start <= self.strip_width:
+            raise ValueError("strip_width_start must be in (0, strip_width]")
+        if int(self.strip_anneal_updates) != self.strip_anneal_updates or self.strip_anneal_updates < 0:
+            raise ValueError("strip_anneal_updates must be a nonnegative integer")
+        if (self.strip_width_start is None) != (self.strip_anneal_updates == 0):
+            raise ValueError("A strip schedule needs both strip_width_start and strip_anneal_updates")
+        if self.uniform_jump_from_update is not None and self.uniform_jump_from_update < 0:
+            raise ValueError("uniform_jump_from_update must be nonnegative")
+        if self.time_sampling == "inference_grid":
+            if self.has_time_schedule:
+                raise ValueError("inference_grid sampling has no strip or sampling schedule")
+            for k in self.grid_steps:      # every grid jump must lie inside the trained strip
+                self.inference_nodes(k, "cpu")
         if self.dt_method not in ("auto", "ad", "central_fd", "forward_fd"):
             raise ValueError(f"Unknown dt_method: {self.dt_method}")
         if self.jvp_attention not in ("explicit", "tvm"):
@@ -79,6 +107,22 @@ class FlowMapObjectiveConfig:
             raise ValueError("schedule_shift and map_weight must be positive")
         if self.self_distillation and self.diagonal_weight == 0:
             raise ValueError("Self-distillation requires a positive diagonal FM weight")
+
+    @property
+    def has_time_schedule(self):
+        return self.strip_width_start is not None or self.uniform_jump_from_update is not None
+
+    def strip_width_at(self, update):
+        """Maximum jump at optimizer update ``update`` (the final width without a schedule)."""
+        if self.strip_width_start is None:
+            return self.strip_width
+        frac = min(1.0, max(0, update) / self.strip_anneal_updates)
+        return self.strip_width_start + (self.strip_width - self.strip_width_start) * frac
+
+    def time_sampling_at(self, update):
+        if self.uniform_jump_from_update is not None and update >= self.uniform_jump_from_update:
+            return "uniform_jump"
+        return self.time_sampling
 
     @property
     def self_distillation(self):
@@ -164,22 +208,29 @@ def lmd_residual(dX_dt, b_teacher):
 
 def sample_level_pair_strip(batch_size, strip, device, dtype, sigma_min=0., sigma_max=1.,
                             generator=None, sampling="uniform_triangle"):
-    """Uniform area on sigma_min <= t <= s <= sigma_max, s-t <= strip.
+    """Off-diagonal pairs sigma_min <= t < s <= sigma_max with jump s - t <= strip.
 
-    At full width this is the same distribution as sorting two independent
-    uniforms (Boffi's triangle, with reversed time direction). Inverse-CDF
-    sampling also supports narrow strips without rejection or clipping bias.
+    uniform_triangle: uniform area. At full width this is the same distribution as
+    sorting two independent uniforms (Boffi's triangle, with reversed time
+    direction); the jump density is proportional to (1 - h), so large jumps are rare.
+    Inverse-CDF sampling also supports narrow strips without rejection or clipping bias.
+    uniform_jump: the jump h is uniform on (0, strip], then the source uniform over
+    where it fits, so one-step-sized jumps are as frequent as small ones.
     The old uniform-source conditional proposal remains an explicit ablation.
     """
     if not 0 < strip <= 1 or not 0 <= sigma_min < sigma_max <= 1:
         raise ValueError("Invalid strip or sigma bounds")
-    if sampling not in ("uniform_triangle", "conditional"):
+    if sampling not in ("uniform_triangle", "uniform_jump", "conditional"):
         raise ValueError(f"Unknown time sampling: {sampling}")
     dtype = torch.float64 if dtype == torch.float64 else torch.float32
     u = torch.rand(batch_size, device=device, dtype=dtype, generator=generator).clamp_min(1e-6)
     w = torch.rand(batch_size, device=device, dtype=dtype, generator=generator).clamp_min(1e-6)
     length = sigma_max - sigma_min
     width = min(strip, length)
+    if sampling == "uniform_jump":
+        jump = width * u
+        s = sigma_min + jump + (length - jump) * w
+        return s, s - jump
     if sampling == "uniform_triangle":
         # Source density is proportional to the available target interval.
         # Its unnormalized CDF is y^2/2 for y <= width, then width*y-width^2/2.
@@ -191,6 +242,31 @@ def sample_level_pair_strip(batch_size, strip, device, dtype, sigma_min=0., sigm
     s = sigma_min + offset
     t = s - offset.clamp(max=width) * w
     return s, t
+
+
+def sample_inference_grid_pairs(batch_size, grid_steps, device, shift=1.0, generator=None):
+    """Pairs on exactly the maps K-step sampling composes: K uniform over ``grid_steps``,
+    a segment [node_{i+1}, node_i] of the K-step grid uniformly, source s = node_i and
+    t uniform along the segment (the Lagrangian residual needs the whole path to
+    pin the segment's endpoint). Grid nodes as in ``inference_nodes`` (shifted)."""
+    steps = torch.tensor(grid_steps, dtype=torch.float32, device=device)
+    k = steps[torch.randint(len(grid_steps), (batch_size,), device=device, generator=generator)]
+    i = torch.floor(torch.rand(batch_size, device=device, generator=generator) * k).clamp(max=k - 1)
+    node = lambda u: shift * u / (1 + (shift - 1) * u)
+    s, lo = node(1 - i / k), node(1 - (i + 1) / k)
+    w = torch.rand(batch_size, device=device, generator=generator).clamp_min(1e-6)
+    return s, s - (s - lo) * w
+
+
+def training_time_pairs(cfg, batch_size, device, update=None):
+    """Off-diagonal (s, t) for one batch at optimizer update ``update`` (schedules resolved)."""
+    if cfg.has_time_schedule and update is None:
+        raise ValueError("A flow-map time schedule needs the optimizer update (training_loss(update=...))")
+    width = cfg.strip_width if update is None else cfg.strip_width_at(update)
+    sampling = cfg.time_sampling if update is None else cfg.time_sampling_at(update)
+    if sampling == "inference_grid":
+        return sample_inference_grid_pairs(batch_size, cfg.grid_steps, device, cfg.schedule_shift)
+    return sample_level_pair_strip(batch_size, width, device, torch.float32, sampling=sampling)
 
 
 def map_residuals(predict, teacher, x, s, t, cfg, diagnostics=None):

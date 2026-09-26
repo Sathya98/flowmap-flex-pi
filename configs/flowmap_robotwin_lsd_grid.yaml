@@ -1,0 +1,20 @@
+# RoboTwin LSD, grid time sampling (see flowmap_robotwin_study.yaml).
+# Off-diagonal pairs are exactly the 1-step and 2-step sampling maps, 50/50, all run:
+# 1-jump s=1, t~U[0,1]; 2-jump s in {1, 0.5}, t~U[s-0.5, s].
+# Init: released RoboTwin FM checkpoint (the study's AGIBOT init is unavailable:
+# a labelled deviation). 75% diagonal FM / 25% off-diagonal, learned time weight.
+defaults:
+  - flowmap_robotwin_study
+  - _self_
+wandb:
+  name: robotwin-lsd-grid-s42
+  group: robotwin-lsd
+model:
+  flow_map:
+    objective: lsd
+    lmd_teacher_gradient: detached
+    teacher_checkpoint: null
+    learned_time_weighting: true
+    self_diagonal_fraction: 0.75
+    time_sampling: inference_grid
+    grid_steps: [1, 2]

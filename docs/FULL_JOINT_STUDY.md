@@ -200,3 +200,20 @@ checkpoints permit resuming via `resume=/absolute/path/to/checkpoints/state/step
 The experiment generator explicitly passes `--teacher-steps` (default 16) to
 PFMM runs rather than inheriting the four-step debugging value. LMD and EMD use
 teacher vector-field queries and do not use this Euler composition setting.
+
+## RoboTwin runs, 2026-09-26 (time-sampling comparison)
+
+Four 2,000-update runs (effective batch 192, one 4×H100 node each), from the released
+RoboTwin checkpoint `step_048060`: {LMD with full teacher gradients, LSD} × two ways of
+sampling the off-diagonal pairs (s, t) (`flow_map.time_sampling`, flowmap_core):
+
+- **grid** (`configs/flowmap_robotwin_{lmd,lsd}_grid.yaml`): exactly the maps that 1-step and
+  2-step sampling compose, 50/50 throughout — 1-jump: s = 1, t ~ U[0, 1]; 2-jump:
+  s ∈ {1, 0.5}, t ~ U[s − 0.5, s]. NFE ≥ 4 queries untrained sources (generalization only).
+- **curriculum** (`..._curriculum.yaml`): the maximum jump grows 0.25 → 1.0 over updates
+  0–1000 (Boffi et al., self-distillation App. F.2, untested there), then all jumps with the
+  jump size uniform instead of uniform-by-area (jumps > 0.9: ~10% of pairs instead of 1%).
+
+Deviation: **LSD starts from the task release**, not AGIBOT (unavailable); label it so.
+Settings shared in `configs/flowmap_robotwin_study.yaml`; run directories
+`runs/flowmap_fulljoint/robotwin_{lmd,lsd}_{grid,curriculum}_s42_20260926`.

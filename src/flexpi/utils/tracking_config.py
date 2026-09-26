@@ -10,6 +10,8 @@ def tracking_config(cfg):
         'model.flow_map.objective', 'model.flow_map.streams',
         'model.flow_map.lmd_teacher_gradient', 'model.flow_map.dt_method',
         'model.flow_map.detach_derivatives', 'model.flow_map.time_sampling',
+        'model.flow_map.strip_width', 'model.flow_map.grid_steps', 'model.flow_map.strip_width_start',
+        'model.flow_map.strip_anneal_updates', 'model.flow_map.uniform_jump_from_update',
         'model.flow_map.distill_ema', 'model.flow_map.ema_decays',
         'model.flow_map.distill_learned_time_weighting',
     )

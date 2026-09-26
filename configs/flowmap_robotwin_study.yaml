@@ -1,0 +1,51 @@
+# RoboTwin full-joint study (2026-09-26): {LMD, LSD} x {inference-grid, curriculum} time
+# sampling, 2000 updates of 192 (mb2 x 24 x 4 GPUs). Shared settings mirror
+# flowmap_libero_lmd_full except the data; each arm config sets objective + sampling.
+# Fast path: latent cache, fused TVM attention JVP, microbatch 2, background EMA.
+# Storage: weights every 500 (raw + EMA 0.9999, ~24 GB each), one resumable state.
+defaults:
+  - flowmap_robotwin_base
+  - _self_
+output_dir: ${oc.env:FLOWMAP_RUN_DIR,./runs/flowmap_fulljoint/robotwin_study_manual}
+max_steps: 2000
+batch_size: 2
+gradient_accumulation_steps: 24
+learning_rate: 1.0e-5
+fused_adamw: true
+num_workers: 4
+log_every: 1
+save_every: 500
+keep_last_n_states: 1
+keep_last_n_weights: 1
+keep_weight_steps: [2, 500, 1000, 1500, 2000]
+fail_on_nonfinite: true
+# Pause at an optimizer boundary and resume the SAME schedule in the next 24 h job.
+max_runtime_seconds: 72000
+stop_after_steps: null
+# Training-set previews (not benchmark validation): one clip from each of four tasks
+# (first frames of episodes 0, 6875, 13750, 20625).
+eval_every: 250
+eval_video: true
+eval_num_inference_steps: 2
+eval_nfes: [1, 2, 4]
+eval_namespace: train_preview
+eval_seed: 2026
+eval_at_start: false
+eval_on_pause: true
+eval_fixed_indices: [0, 1397665, 2790651, 4065121]
+wandb:
+  enabled: true
+  workspace: null
+  isolated: true
+  project: flowmap-flex-pi
+  mode: offline
+data:
+  latent_cache_dir: ./data/latent_cache/robotwin_s8_v1
+model:
+  flow_map:
+    jvp_attention: tvm
+    ema_decays: [0.9999]
+    dt_method: ad
+    detach_derivatives: false
+    strip_width: 1.0
+    schedule_shift: 1.0

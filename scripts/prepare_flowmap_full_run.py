@@ -26,8 +26,11 @@ def main():
     run=(args.run_dir or root/'runs/flowmap_fulljoint'/f'libero_lmd_fullgrad_s42_{stamp}').resolve()
     run.mkdir(parents=True,exist_ok=False)
     code=run/'code';code.mkdir()
-    for directory in ('src','configs','scripts','experiments'):
-        shutil.copytree(root/directory,code/directory,ignore=shutil.ignore_patterns('__pycache__','*.pyc'))
+    # flowmap_core is imported by FlexPi (module aliases): freeze it too, or the run
+    # would import the live editable install. The launcher puts code/flowmap_core/src first.
+    for directory in ('src','configs','scripts','experiments','flowmap_core'):
+        shutil.copytree(root/directory,code/directory,
+                        ignore=shutil.ignore_patterns('__pycache__','*.pyc','*.egg-info'))
     for directory in ('checkpoints','data','third_party'):
         (code/directory).symlink_to(root/directory,target_is_directory=True)
     for file in ('pyproject.toml','README.md'):
@@ -41,7 +44,7 @@ def main():
         identity['url']=f"https://wandb.ai/{identity['entity']}/{identity['project']}/runs/{identity['id']}"
     (run/'wandb_run.json').write_text(json.dumps(identity,indent=2)+'\n')
     hashes={str(p.relative_to(code)):hashlib.sha256(p.read_bytes()).hexdigest()
-            for folder in ('src','configs','scripts','experiments') for p in (code/folder).rglob('*') if p.is_file()}
+            for folder in ('src','configs','scripts','experiments','flowmap_core') for p in (code/folder).rglob('*') if p.is_file()}
     manifest=dict(created_utc=stamp,source_root=str(root),run_dir=str(run),
         branch=subprocess.check_output(['git','branch','--show-current'],cwd=root,text=True).strip(),
         revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=root,text=True).strip(),

@@ -1,0 +1,20 @@
+# RoboTwin LMD, curriculum time sampling (see flowmap_robotwin_study.yaml).
+# Curriculum: max jump grows 0.25 -> 1.0 over updates 0-1000 (uniform area), then all
+# jumps with the jump size uniform (tilts toward large, one-step-sized jumps).
+defaults:
+  - flowmap_robotwin_study
+  - _self_
+wandb:
+  name: robotwin-lmd-curriculum-s42
+  group: robotwin-lmd
+model:
+  flow_map:
+    objective: lmd
+    lmd_teacher_gradient: full
+    distill_ema: true
+    distill_learned_time_weighting: false
+    teacher_checkpoint: ${pretrained_ckpt}
+    time_sampling: uniform_triangle
+    strip_width_start: 0.25
+    strip_anneal_updates: 1000
+    uniform_jump_from_update: 1000

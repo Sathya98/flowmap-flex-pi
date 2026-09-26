@@ -54,7 +54,7 @@ class DiagnosticTests(unittest.TestCase):
         model=tiny_model(objective='lsd')
         for sampling in ('uniform_triangle','conditional'):
             model.flow_map.time_sampling=sampling
-            with patch('flexpi.models.helpers.flowmap_training.sample_level_pair_strip',
+            with patch('flowmap_core.flowmap.sample_level_pair_strip',  # called via training_time_pairs
                        wraps=sample_level_pair_strip) as draw:
                 data = batch(b=1)
                 data["_flowmap_diagonal_mask"] = torch.zeros(1, dtype=torch.bool)

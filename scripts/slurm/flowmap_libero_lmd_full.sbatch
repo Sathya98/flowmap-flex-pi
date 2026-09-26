@@ -24,7 +24,9 @@ source /gpfs/scratch1/shared/faster-wams/env_flexpi.sh
 # Execute the frozen source snapshot, not a later working-tree revision.
 export FLEXPI_ROOT="$run_dir/code"
 export FLOWMAP_RUN_DIR="$run_dir"
-export PYTHONPATH="$FLEXPI_ROOT/src:${PYTHONPATH:-}"
+# The frozen flowmap_core must shadow the editable install of the live tree.
+[[ -d "$FLEXPI_ROOT/flowmap_core/src/flowmap_core" ]] || { echo 'Run snapshot lacks flowmap_core; re-prepare it' >&2; exit 2; }
+export PYTHONPATH="$FLEXPI_ROOT/flowmap_core/src:$FLEXPI_ROOT/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=2
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
@@ -118,7 +120,8 @@ srun --ntasks=1 --kill-on-bad-exit=1 python -m accelerate.commands.launch \
   --num_processes 4 --num_machines 1 \
   --main_process_port "$((15000 + SLURM_JOB_ID % 30000))" \
   scripts/train.py --config-name="$config_name" "${overrides[@]}"
-# A failed/OOM run never queues more compute. Checkpoints AND previews must pass.
+# A failed/OOM run never queues more compute. Generic over configs (LIBERO or RoboTwin):
+# the run manifest names the config. Checkpoints AND previews must pass.
 python scripts/flowmap_run_state.py validate "$run_dir" --initial-step "$initial_step"
 if [[ "$phase" = hardware ]]; then
   [[ "$(python scripts/flowmap_run_state.py step "$run_dir")" = 2 ]] || exit 2
@@ -126,7 +129,7 @@ fi
 if [[ "$(python scripts/flowmap_run_state.py complete "$run_dir")" = 1 || -e "$run_dir/STOP" ]]; then
   exit 0
 fi
-next_job="$(sbatch --parsable --time=24:00:00 --dependency="afterok:$SLURM_JOB_ID" \
+next_job="$(sbatch --parsable --time=24:00:00 --job-name="$SLURM_JOB_NAME" --dependency="afterok:$SLURM_JOB_ID" \
   "$FLEXPI_ROOT/scripts/slurm/flowmap_libero_lmd_full.sbatch" "$run_dir" train "$target_steps")"
 printf '%s\n' "$next_job" >> "$run_dir/continuation_jobs.txt"
 echo "Checkpoint validated; continuation job=$next_job"

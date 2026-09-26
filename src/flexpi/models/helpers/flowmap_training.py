@@ -3,7 +3,7 @@ from contextlib import contextmanager, nullcontext
 import torch
 
 from .flowmap_self import slice_batch
-from .flowmap import STREAMS, affine_flow_map, map_residuals, sample_level_pair_strip
+from .flowmap import STREAMS, affine_flow_map, map_residuals, training_time_pairs
 
 
 _DEFER_METRICS = False
@@ -158,8 +158,8 @@ def training_loss(model, sample, tiled=False, *, times=None, noise=None,
         s = torch.rand(b, device=clean['action'].device, dtype=torch.float32)
         t = s
     elif times is None:
-        s, t = sample_level_pair_strip(b, cfg.strip_width, clean['action'].device, torch.float32,
-                                      sampling=cfg.time_sampling)
+        # The trainer sets model._flowmap_update (optimizer step) for scheduled sampling.
+        s, t = training_time_pairs(cfg, b, clean['action'].device, getattr(model, '_flowmap_update', None))
     else:
         s, t = (a.to(device=clean['action'].device, dtype=torch.float32) for a in times)
         if s.shape != (b,) or t.shape != (b,) or not (s.is_cuda and torch.cuda.is_current_stream_capturing()) and not bool(
@@ -236,6 +236,8 @@ def training_loss(model, sample, tiled=False, *, times=None, noise=None,
                 total = total + weight * (cfg.map_weight * off + diagonal_weight * diag)
                 metrics['loss_flowmap_' + name] = _metric(off)
                 metrics['loss_diagonal_' + name] = _metric(diag)
+            if cfg.has_time_schedule:
+                metrics['time_max_jump'] = cfg.strip_width_at(getattr(model, '_flowmap_update', 0))
             if cfg.self_distillation or cfg.uses_time_weighting:
                 metrics['loss_unweighted'] = _metric(total)
                 if cfg.self_distillation:

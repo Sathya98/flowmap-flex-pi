@@ -261,3 +261,29 @@ def test_background_ema_matches_synchronous_updates():
     state = background.state_dict()      # waits for the pending fold
     assert state['updates'] == 4 and background._pending is None
     EvaluationEMA.CHUNK = chunk
+
+
+def test_scheduled_and_grid_time_sampling_in_training_loss():
+    # Grid arm: every off-diagonal source is a 1- or 2-step grid node.
+    torch.manual_seed(0)
+    model = tiny_model(objective='lsd', time_sampling='inference_grid', grid_steps=(1, 2))
+    data = batch(b=4)
+    data['_flowmap_diagonal_mask'] = torch.zeros(4, dtype=torch.bool)
+    seen = {}
+    loss, metrics = training_loss(model, data, diagnostics=seen)
+    loss.backward()
+    assert set(seen['s'].tolist()) <= {1.0, 0.5} and 'time_max_jump' not in metrics
+    # Curriculum arm: the trainer's update sets the maximum jump; missing update is an error.
+    model = tiny_model(objective='lmd', strip_width_start=0.25, strip_anneal_updates=1000,
+                       uniform_jump_from_update=1000)
+    from flexpi.models.helpers.adaptation import clone_teacher
+    object.__setattr__(model, 'flow_map_teacher', clone_teacher(model))
+    import pytest
+    with pytest.raises(ValueError, match='optimizer update'):
+        training_loss(model, batch(b=2))
+    model._flowmap_update = 0
+    seen = {}
+    loss, metrics = training_loss(model, batch(b=8), diagnostics=seen)
+    assert float((seen['s'] - seen['t']).max()) <= 0.25 + 1e-6 and metrics['time_max_jump'] == 0.25
+    model._flowmap_update = 1500
+    assert training_loss(model, batch(b=2))[1]['time_max_jump'] == 1.0

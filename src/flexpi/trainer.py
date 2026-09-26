@@ -1872,6 +1872,8 @@ class Wan22Trainer:
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
                 flow = getattr(train_model, "flow_map", None)
+                if flow is not None and flow.enabled:
+                    train_model._flowmap_update = self.global_step   # scheduled time sampling
                 if flow is not None and flow.enabled and flow.self_distillation:
                     from .models.helpers.flowmap_self import update_diagonal_mask
                     if sample['action'].shape[0] != self.batch_size:
