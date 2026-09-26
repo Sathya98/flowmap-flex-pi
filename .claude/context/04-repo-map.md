@@ -83,7 +83,7 @@ wire contract + emergency-stop rules are in `docs/YAM.md`.
 ## 6. Dependencies (`pyproject.toml`)
 Python ≥3.10, CUDA 12.8. Core: `torch==2.7.1+cu128`, `torchvision`, `torchcodec==0.5`,
 `decord2==3.3.0` (imports as `decord`; the depth/AV1 fast path), `accelerate==1.12.0`,
-`deepspeed==0.18.5`, `transformers==4.49.0`, `timm==1.0.26` (DINOv3), `hydra-core==1.3.2`,
+`deepspeed==0.18.9`, `transformers==4.49.0`, `timm==1.0.26` (DINOv3), `hydra-core==1.3.2`,
 `av==16.0.1`, `huggingface-hub==0.29.2`, `wandb`. Extras:
 - `.[libero]` — `mujoco==3.3.2` (pin is load-bearing: 3.8.0 shifts libero_object OOD),
   `bddl`, `gym`; **`robosuite==1.4.0` installed separately with `--no-deps`**.

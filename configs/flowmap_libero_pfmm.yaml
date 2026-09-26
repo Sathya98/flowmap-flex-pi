@@ -1,0 +1,28 @@
+# Full-budget starting recipe; teacher accuracy and learning rate still need tuning.
+defaults:
+  - flowmap_libero_pfmm_smoke
+  - _self_
+
+output_dir: ./runs/flowmap_fulljoint/libero_pfmm_${oc.env:SLURM_JOB_ID,manual}
+max_steps: null
+num_epochs: 20
+batch_size: 1
+# On four GPUs: 1 * 48 * 4 = 192 examples/update, matching the LIBERO
+# preset's 6 * 8 * 4. Increase microbatch after measuring memory, keeping
+# microbatch * accumulation fixed. This is not a verified release batch size.
+gradient_accumulation_steps: 48
+num_workers: 4
+learning_rate: 1.0e-5
+log_every: 5
+save_every: 250
+# The current LIBERO config has no held-out val dataset. Trainer eval would
+# reuse training data; select checkpoints with separate validation rollouts.
+eval_every: 0
+keep_last_n_states: 2
+keep_last_n_weights: 4
+
+model:
+  flow_map:
+    # Provisional: compare paired targets at 8/16/32 (64 if needed) first.
+    # Independent of the student's evaluation NFE.
+    teacher_steps: 16

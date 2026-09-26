@@ -13,6 +13,7 @@ is bit-identical after the flatten.
 from __future__ import annotations
 
 import copy
+from dataclasses import asdict
 from typing import Dict, Optional
 
 import torch
@@ -33,6 +34,7 @@ from .mot import MoT
 from .pointmap_encoder import PointmapEncoder
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 from .wan_video_dit import sinusoidal_embedding_1d
+from .helpers.normalization import ForwardADLayerNorm
 
 logger = get_logger(__name__)
 
@@ -43,6 +45,10 @@ from flexpi.utils.pytorch_utils import _staged_randn
 
 from .backbone import FlexPiBackbone
 from .helpers.flex_joint import FlexJointConfig, sample_flex_batch_flags
+from .helpers.flowmap import (
+    FlowMapConfig,
+    affine_flow_map,
+)
 from .inference_opt.step_skip import StepSkipController, resolve_sim_sources
 
 
@@ -223,7 +229,7 @@ class FlexPi(FlexPiBackbone):
 
         # --- DINO embedding layers ---
         # LayerNorm on the raw DINO features at the Linear-embed input.
-        self.dino_feature_norm = nn.LayerNorm(self._dino_per_view_dim)
+        self.dino_feature_norm = ForwardADLayerNorm(self._dino_per_view_dim)
         self.dino_embedder = nn.Linear(self.dino_dim, video_hidden_dim)
         self.dino_proj_out = nn.Linear(video_hidden_dim, self.dino_dim)
         self._init_dino_layers()
@@ -882,6 +888,10 @@ class FlexPi(FlexPiBackbone):
     # ------------------------------------------------------------------
 
     def build_inputs(self, sample, tiled: bool = False):
+        if "cached_input_latents" in sample:
+            # Frozen-encoder outputs precomputed by scripts/cache_latents.py.
+            from ..datasets.latent_cache import build_inputs_from_cache
+            return build_inputs_from_cache(self, sample)
         inputs = super().build_inputs(sample, tiled=tiled)
 
         # --- DINO features (encoded on the fly from per_cam / video) ---
@@ -991,17 +1001,20 @@ class FlexPi(FlexPiBackbone):
 
     def _build_stream_t_mod(
         self, timestep_per_token: torch.Tensor, seq_len: int, B: int,
+        delta_per_token: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Shared time-embedding path for DINO / pointmap tokens.
 
         ``timestep_per_token`` is [B, seq_len] with 0 for first-frame anchors.
+        ``delta_per_token`` (flow map only) is the per-token jump Δ in the same
+        layout, 0 for anchors; ``None`` keeps the original single-time path
+        byte-identical. Routed through ``video_expert.embed_time`` so the Δ
+        module is shared by all visual streams.
         """
-        t_emb = sinusoidal_embedding_1d(
-            self.video_expert.freq_dim, timestep_per_token.reshape(-1),
-        )
-        t = self.video_expert.time_embedding(t_emb).reshape(
-            B, seq_len, self.video_expert.hidden_dim,
-        )
+        delta_flat = None if delta_per_token is None else delta_per_token.reshape(-1)
+        t = self.video_expert.embed_time(
+            timestep_per_token.reshape(-1), delta_flat,
+        ).reshape(B, seq_len, self.video_expert.hidden_dim)
         return self.video_expert.time_projection(t).unflatten(
             2, (6, self.video_expert.hidden_dim),
         )
@@ -1382,6 +1395,10 @@ class FlexPi(FlexPiBackbone):
         }
         return total, loss_dict
 
+    def _flowmap_training_loss(self, sample, tiled: bool = False):
+        from .helpers.flowmap_training import training_loss
+        return training_loss(self, sample, tiled)
+
     # ------------------------------------------------------------------
     # Joint noise prediction — used by inference at eval
     # ------------------------------------------------------------------
@@ -1482,6 +1499,10 @@ class FlexPi(FlexPiBackbone):
         dino_freqs: torch.Tensor | None = None,
         pt_freqs: torch.Tensor | None = None,
         flex_block_attention: bool = False,
+        timestep_delta_action: Optional[torch.Tensor] = None,
+        timestep_delta_video: Optional[torch.Tensor] = None,
+        timestep_delta_dino: Optional[torch.Tensor] = None,
+        timestep_delta_pointmap: Optional[torch.Tensor] = None,
     ):
         B = latents_video.shape[0]
 
@@ -1489,24 +1510,33 @@ class FlexPi(FlexPiBackbone):
             x=latents_video, timestep=timestep_video,
             context=context, context_mask=context_mask,
             action=gt_action, fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
+            timestep_delta=timestep_delta_video,
         )
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action, timestep=timestep_action,
             context=context, context_mask=context_mask,
+            timestep_delta=timestep_delta_action,
         )
 
         Sv = video_pre["tokens"].shape[1]
         Sa = action_pre["tokens"].shape[1]
         tpf = int(video_pre["meta"]["tokens_per_frame"])
 
+        video_pre["tokens"] = self._flex_zero_absent_video_tokens(video_pre["tokens"], tpf)
+
         # DINO
         dino_tokens = self._embed_dino(latents_dino)
         Sd = dino_tokens.shape[1]
         num_dino_frames = int(latents_dino.shape[2])
         dtpf = int(latents_dino.shape[3])
+        dino_tokens = self._flex_zero_absent_dino_tokens(dino_tokens, dtpf)
         dino_token_timesteps = timestep_dino.view(B, 1).expand(B, Sd).clone()
         dino_token_timesteps[:, :dtpf] = 0
-        dino_t_mod = self._build_stream_t_mod(dino_token_timesteps, Sd, B)
+        dino_delta = None
+        if timestep_delta_dino is not None:
+            dino_delta = timestep_delta_dino.view(B, 1).expand(B, Sd).clone()
+            dino_delta[:, :dtpf] = 0
+        dino_t_mod = self._build_stream_t_mod(dino_token_timesteps, Sd, B, dino_delta)
         # DINO RoPE — use precomputed when caller hoisted it (compile mode);
         # otherwise compute on demand (training / eager-eval).
         if dino_freqs is None:
@@ -1522,21 +1552,24 @@ class FlexPi(FlexPiBackbone):
             Sp = ptpf = 0
         else:
             pointmap_tokens, ptpf, pt_meta = self._embed_pointmap(latents_pointmap)
+            pointmap_tokens = self._flex_zero_absent_pointmap_tokens(pointmap_tokens, ptpf)
             Sp = pointmap_tokens.shape[1]
             num_pt_frames = int(latents_pointmap.shape[2])
             pt_token_timesteps = timestep_pointmap.view(B, 1).expand(B, Sp).clone()
             pt_token_timesteps[:, :ptpf] = 0
-            pt_t_mod = self._build_stream_t_mod(pt_token_timesteps, Sp, B)
+            pt_delta = None
+            if timestep_delta_pointmap is not None:
+                pt_delta = timestep_delta_pointmap.view(B, 1).expand(B, Sp).clone()
+                pt_delta[:, :ptpf] = 0
+            pt_t_mod = self._build_stream_t_mod(pt_token_timesteps, Sp, B, pt_delta)
             if pt_freqs is None:
                 pt_freqs = self._compute_pointmap_freqs(
                     num_pt_frames, video_pre["tokens"].device, pt_meta=pt_meta,
                 )
-            pt_t_emb = sinusoidal_embedding_1d(
-                self.video_expert.freq_dim, pt_token_timesteps.reshape(-1),
-            )
-            pt_t = self.video_expert.time_embedding(pt_t_emb).reshape(
-                B, Sp, self.video_expert.hidden_dim,
-            )
+            pt_t = self.video_expert.embed_time(
+                pt_token_timesteps.reshape(-1),
+                None if pt_delta is None else pt_delta.reshape(-1),
+            ).reshape(B, Sp, self.video_expert.hidden_dim)
 
         merged_tokens, merged_freqs, merged_t_mod, merged_ctx_mask = (
             self._merge_aux_into_video_stream(
@@ -1563,19 +1596,31 @@ class FlexPi(FlexPiBackbone):
             Sv, Sa, Sd, Sp_for_mask, tpf, effective_dtpf, ptpf_for_mask, merged_tokens.device,
         )
 
-        merged_out, action_out = self.mot._forward_joint_inner(
-            video_tokens=merged_tokens,
-            action_tokens=action_pre["tokens"],
-            video_freqs=merged_freqs,
-            action_freqs=action_pre["freqs"],
-            video_t_mod=merged_t_mod,
-            action_t_mod=action_pre["t_mod"],
-            video_context_payload={"context": video_pre["context"], "mask": merged_ctx_mask},
-            action_context_payload={"context": action_pre["context"], "mask": action_pre["context_mask"]},
-            attention_mask=attention_mask,
-            sub_stream_lens=sub_stream_lens,
-            sub_stream_self_masks=sub_stream_self_masks,
-        )
+        if self.mot.training and torch.is_grad_enabled():
+            tokens = self.mot(
+                embeds_all={"video": merged_tokens, "action": action_pre["tokens"]},
+                attention_mask=attention_mask,
+                freqs_all={"video": merged_freqs, "action": action_pre["freqs"]},
+                t_mod_all={"video": merged_t_mod, "action": action_pre["t_mod"]},
+                context_all={"video": {"context": video_pre["context"], "mask": merged_ctx_mask},
+                             "action": {"context": action_pre["context"], "mask": action_pre["context_mask"]}},
+                sub_stream_lens=sub_stream_lens, sub_stream_self_masks=sub_stream_self_masks,
+            )
+            merged_out, action_out = tokens["video"], tokens["action"]
+        else:
+            merged_out, action_out = self.mot._forward_joint_inner(
+                video_tokens=merged_tokens,
+                action_tokens=action_pre["tokens"],
+                video_freqs=merged_freqs,
+                action_freqs=action_pre["freqs"],
+                video_t_mod=merged_t_mod,
+                action_t_mod=action_pre["t_mod"],
+                video_context_payload={"context": video_pre["context"], "mask": merged_ctx_mask},
+                action_context_payload={"context": action_pre["context"], "mask": action_pre["context_mask"]},
+                attention_mask=attention_mask,
+                sub_stream_lens=sub_stream_lens,
+                sub_stream_self_masks=sub_stream_self_masks,
+            )
 
         video_tokens_out = merged_out[:, :Sv, :]
         dino_tokens_out = merged_out[:, Sv:Sv + Sd, :]
@@ -1817,7 +1862,7 @@ class FlexPi(FlexPiBackbone):
             device=self.device, dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        if self._use_loop_compile():
+        if self._use_loop_compile() and not self.flow_map.enabled:
             # torch_compile_scope="loop": KV-cache prefill + entire denoise
             # loop fused into one compiled call (single CUDA Graph region per
             # call — no Python between prefill and steps). Identical math to
@@ -1853,6 +1898,11 @@ class FlexPi(FlexPiBackbone):
                 video_sub_stream_lens=v_sub_lens,
                 video_sub_stream_self_masks=v_sub_masks,
             )
+            if self.flow_map.enabled:
+                latents_action = self._sample_flowmap_action_cache(
+                    latents_action, context, context_mask, video_kv_cache, mask,
+                    video_seq_len, num_inference_steps, sigma_shift)
+                return {"action": latents_action[0].detach().float().cpu()}
             for step_t, step_delta in zip(infer_timesteps, infer_deltas):
                 timestep_action = step_t.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
                 pred_action = self._predict_action_noise_with_cache(
@@ -1870,6 +1920,18 @@ class FlexPi(FlexPiBackbone):
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
+
+    def _sample_flowmap_action_cache(self, latents, context, context_mask, cache, mask, video_len, steps, shift):
+        nodes = self.flow_map.inference_nodes(steps, self.device, shift)
+        n = self.infer_action_scheduler.num_train_timesteps
+        # Accumulate large jumps in fp32, casting only at the network boundary.
+        latents = latents.float()
+        for lo, hi in zip(nodes[:-1], nodes[1:]):
+            velocity = self._predict_action_grad_safe(
+                latents.to(self.torch_dtype), (lo*n).reshape(1), context, context_mask,
+                cache, mask, video_len, timestep_delta_action=((hi-lo)*n).reshape(1))
+            latents = affine_flow_map(latents, velocity.float(), lo, hi)
+        return latents
 
     def _action_prefill_denoise_loop_body(
         self,
@@ -2137,6 +2199,12 @@ class FlexPi(FlexPiBackbone):
             video_sub_stream_lens=v_sub_lens,
             video_sub_stream_self_masks=v_sub_masks,
         )
+
+        if self.flow_map.enabled:
+            latents_action = self._sample_flowmap_action_cache(
+                latents_action, context, context_mask, video_kv_cache, mask,
+                merged_video_seq_len, num_inference_steps, sigma_shift)
+            return {"action": latents_action[0].detach().float().cpu()}
 
         infer_timesteps, infer_deltas = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -2432,9 +2500,9 @@ class FlexPi(FlexPiBackbone):
         context=None,
         context_mask=None,
         negative_prompt=None,
-        text_cfg_scale: float = 5.0,
+        text_cfg_scale: Optional[float] = None,
         action_cfg_scale: float = 1.0,
-        num_inference_steps: int = 20,
+        num_inference_steps: Optional[int] = None,
         sigma_shift=None,
         seed=None,
         rand_device: str = "cpu",
@@ -2449,6 +2517,7 @@ class FlexPi(FlexPiBackbone):
         this class to consume them — unlike the inherited
         ``FlexPi.infer_joint``).
         """
+        text_cfg_scale = (1.0 if self.flow_map.enabled else 5.0) if text_cfg_scale is None else text_cfg_scale
         return self.infer_joint(
             prompt=prompt,
             input_image=input_image,
@@ -2488,7 +2557,10 @@ class FlexPi(FlexPiBackbone):
             "mot": self.mot.state_dict(),
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "flow_map": asdict(self.flow_map),
         }
+        if hasattr(self, "flow_map_loss_weight"):
+            payload["flow_map_loss_weight"] = self.flow_map_loss_weight.state_dict()
         for key in self._dino_ckpt_keys() + self._mode_ckpt_keys():
             payload[key] = getattr(self, key).state_dict()
         if self.proprio_encoder is not None:
@@ -2498,7 +2570,26 @@ class FlexPi(FlexPiBackbone):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None, strict_shape: bool = True):
-        payload = super().load_checkpoint(path, optimizer, strict_shape=strict_shape)
+        payload = torch.load(path, map_location="cpu")
+        saved_flow = payload.get("flow_map", {})
+        if saved_flow.get("enabled", False):
+            if not self.flow_map.enabled:
+                raise ValueError("Flow-map checkpoint requires flow_map.enabled=true and its saved adaptation config")
+            for key in ("mode", "rank", "lora_alpha", "streams", "strip_width"):
+                expected, actual = saved_flow.get(key), getattr(self.flow_map, key)
+                if key == "streams":
+                    expected, actual = tuple(expected), tuple(actual)
+                if expected != actual:
+                    raise ValueError(f"Flow-map checkpoint {key} mismatch: saved={expected}, configured={actual}")
+        if hasattr(self, "flow_map_loss_weight"):
+            if "flow_map_loss_weight" in payload:
+                self.flow_map_loss_weight.load_state_dict(payload["flow_map_loss_weight"])
+            elif saved_flow.get("enabled") and (
+                    saved_flow.get("learned_time_weighting", False)
+                    if saved_flow.get("objective") in ("lsd", "esd", "psd_m", "psd_u")
+                    else saved_flow.get("distill_learned_time_weighting", False)):
+                raise ValueError("Flow-map checkpoint is missing learned time weights")
+        payload = super().load_checkpoint(path, optimizer, strict_shape=strict_shape, _payload=payload)
         # ``pointmap_mode='encoder_cond'`` (pointmap tokenized by its own frozen
         # ViT instead of the WAN VAE) was removed — the pointmap head modules
         # differ, so such a checkpoint cannot map onto this model.
@@ -2546,6 +2637,7 @@ class FlexPi(FlexPiBackbone):
         joint_dino: bool = False,
         joint_pointmap: bool = False,
         flex_joint: Optional[FlexJointConfig] = None,
+        flow_map: Optional[FlowMapConfig] = None,
         enable_pointmap: bool = True,
         **kwargs,
     ):
@@ -2554,6 +2646,11 @@ class FlexPi(FlexPiBackbone):
         self.joint_dino = bool(joint_dino)
         self.joint_pointmap = bool(joint_pointmap)
         self.flex_joint = flex_joint if flex_joint is not None else FlexJointConfig()
+        self.flow_map = flow_map if flow_map is not None else FlowMapConfig()
+        # Frozen flow-matching teacher for map distillation; attached by the
+        # trainer when flow_map.enabled (a separate FlexPi with the released
+        # weights, eval()+requires_grad_(False)). None => not a distill run.
+        self.flow_map_teacher = None
         # Whether this run carries a pointmap stream at all. False needs a
         # depth-free data config too — the model skips the stream either way,
         # but only the data config stops the loader decoding depth.
@@ -2588,6 +2685,7 @@ class FlexPi(FlexPiBackbone):
         joint_dino: bool = False,
         joint_pointmap: bool = False,
         flex_joint: Optional[FlexJointConfig] = None,
+        flow_map: Optional[FlowMapConfig] = None,
         enable_pointmap: bool = True,
         **kwargs,
     ):
@@ -2596,6 +2694,7 @@ class FlexPi(FlexPiBackbone):
         model.joint_dino = bool(joint_dino)
         model.joint_pointmap = bool(joint_pointmap)
         model.flex_joint = flex_joint if flex_joint is not None else FlexJointConfig()
+        model.flow_map = flow_map if flow_map is not None else FlowMapConfig()
         model.enable_pointmap = bool(enable_pointmap)
         model._infer_present_v = True
         model._infer_present_d = True
@@ -2622,6 +2721,17 @@ class FlexPi(FlexPiBackbone):
                 model.flex_joint.cross_modal_predict_dino,
                 model.flex_joint.cross_modal_predict_pointmap,
             )
+        if model.flow_map.enabled:
+            from .helpers.adaptation import install_adaptation
+            if "pointmap" in model.flow_map.streams and not model.enable_pointmap:
+                raise ValueError("pointmap flow maps require enable_pointmap=true")
+            model.joint_video = "video" in model.flow_map.streams
+            model.joint_dino = "dino" in model.flow_map.streams
+            model.joint_pointmap = "pointmap" in model.flow_map.streams
+            install_adaptation(model)
+            from .helpers.attention import set_jvp_attention_backend
+            set_jvp_attention_backend(model.flow_map.jvp_attention)
+            logger.info("Forward-AD attention backend: %s", model.flow_map.jvp_attention)
         return model
 
     # ------------------------------------------------------------------
@@ -2951,8 +3061,9 @@ class FlexPi(FlexPiBackbone):
         on ``self._batch_flex``, then delegates. The parent's training_loss +
         the overridden mask builder consume the stashed flags.
         """
+        objective = self._flowmap_training_loss if self.flow_map.enabled else self._base_training_loss
         if not self.flex_joint.enabled:
-            return self._base_training_loss(sample, tiled=tiled)
+            return objective(sample, tiled=tiled)
 
         # Batch size is read from ``action`` (always required by the unified
         # input contract — see build_inputs).
@@ -2966,9 +3077,13 @@ class FlexPi(FlexPiBackbone):
             cfg=self.flex_joint, batch_size=B, device=self.device,
             pointmap_off=self._pointmap_globally_off,
         )
+        if self.flow_map.enabled:
+            for name, flag in (("video", "v"), ("dino", "d"), ("pointmap", "p")):
+                if name not in self.flow_map.streams:
+                    setattr(bf, "j_" + flag, torch.zeros_like(getattr(bf, "j_" + flag)))
         self._batch_flex = bf
         try:
-            return self._base_training_loss(sample, tiled=tiled)
+            return objective(sample, tiled=tiled)
         finally:
             self._batch_flex = None
 
@@ -2988,7 +3103,7 @@ class FlexPi(FlexPiBackbone):
         context_mask=None,
         negative_prompt=None,
         text_cfg_scale: float = 1.0,
-        num_inference_steps: int = 20,
+        num_inference_steps: Optional[int] = None,
         sigma_shift=None,
         seed=None,
         rand_device: str = "cpu",
@@ -3023,6 +3138,18 @@ class FlexPi(FlexPiBackbone):
         present_dino: Optional[bool] = None,
         present_pointmap: Optional[bool] = None,
     ):
+        num_inference_steps = (self.flow_map.num_inference_steps if self.flow_map.enabled else 20) if num_inference_steps is None else num_inference_steps
+        if self.flow_map.enabled:
+            if text_cfg_scale != 1.0 or negative_prompt not in (None, ""):
+                raise ValueError("Guided flow maps require guidance-aware training; use text_cfg_scale=1")
+            if dynamic_step_skip:
+                raise ValueError("Step skipping reuses the wrong flow-map endpoint; disable it")
+            if any(getattr(self, name, None) is not None for name in ('_trt_joint_runner', '_trt_joint_split_runner', '_trt_prefill_runner')):
+                raise ValueError("Legacy TensorRT engines lack two-time inputs; disable TensorRT for flow maps")
+            for name, value in (("video", joint_video), ("dino", joint_dino), ("pointmap", joint_pointmap)):
+                if value and name not in self.flow_map.streams:
+                    raise ValueError(f"Cannot generate {name}: it was not trained as a flow-map stream")
+            self.flow_map.inference_nodes(num_inference_steps, self.device, sigma_shift)
         # Temporarily override self.joint_* when runtime flags are supplied.
         # Restore on exit so concurrent calls / future calls see the trained
         # defaults again.
@@ -3214,7 +3341,7 @@ class FlexPi(FlexPiBackbone):
         context_mask=None,
         negative_prompt=None,
         text_cfg_scale: float = 1.0,
-        num_inference_steps: int = 20,
+        num_inference_steps: Optional[int] = None,
         sigma_shift=None,
         seed=None,
         rand_device: str = "cpu",
@@ -3224,6 +3351,21 @@ class FlexPi(FlexPiBackbone):
         per_cam: Optional[Dict[str, torch.Tensor]] = None,
         per_cam_depth: Optional[Dict[str, torch.Tensor]] = None,
     ):
+        num_inference_steps = (self.flow_map.num_inference_steps if self.flow_map.enabled else 20) if num_inference_steps is None else num_inference_steps
+        if self.flow_map.enabled:
+            if "video" not in self.flow_map.streams:
+                raise ValueError("Video visualization requires a trained video stream; use infer_action or eval_video=false")
+            out = self.infer_action(
+                prompt=prompt, input_image=input_image, num_video_frames=num_video_frames,
+                action_horizon=action_horizon, proprio=proprio, context=context, context_mask=context_mask,
+                negative_prompt=negative_prompt, text_cfg_scale=text_cfg_scale,
+                num_inference_steps=num_inference_steps, sigma_shift=sigma_shift, seed=seed,
+                rand_device=rand_device, tiled=tiled, camera_intrinsics=camera_intrinsics,
+                per_cam=per_cam, per_cam_depth=per_cam_depth, return_stream_latents=True)
+            out['video'] = self._decode_latents(out['video_latents'].to(self.device, self.torch_dtype), tiled=tiled)
+            out.setdefault('dino_latents', None)
+            out.setdefault('pointmap_latents', None)
+            return out
         any_joint = self.joint_video or self.joint_dino or self.joint_pointmap
         if any_joint and test_action_with_infer_action:
             logger.warning(
@@ -3454,6 +3596,22 @@ class FlexPi(FlexPiBackbone):
             context, context_mask = self._append_proprio_to_context(
                 context=context, context_mask=context_mask, proprio=proprio,
             )
+
+        if self.flow_map.enabled:
+            from .helpers.flowmap_training import predict_streams
+            active = {"action"}
+            active.update(name for name, flag in (("video", self.joint_video), ("dino", dino_denoised), ("pointmap", denoise_pointmap)) if flag)
+            state = dict(video=latents_video.float(), dino=latents_dino.float(),
+                         pointmap=None if self._pointmap_globally_off else latents_pointmap.float(), action=latents_action.float())
+            nodes = self.flow_map.inference_nodes(num_inference_steps, self.device, sigma_shift)
+            for lo, hi in zip(nodes[:-1], nodes[1:]):
+                velocity = predict_streams(self, state, lo.reshape(1), hi.reshape(1), context, context_mask, fuse_flag, active)
+                state = {name: affine_flow_map(value, velocity[name], lo, hi) if name in active else value
+                         for name, value in state.items()}
+            out = {"action": state['action'][0].detach().float().cpu()}
+            if return_stream_latents:
+                out.update({name + '_latents': state[name].detach().float().cpu() for name in active if name != 'action'})
+            return out
 
         # --- Schedulers ---
         # When the video stream is disabled the video scheduler is unused;

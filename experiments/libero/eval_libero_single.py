@@ -1015,7 +1015,9 @@ def _predict_action_chunk(
             pred = model.infer_joint(**infer_kwargs)
             predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
-            pred = model.infer_action(**infer_kwargs)
+            residual_probe = getattr(model, '_residual_sensitivity_probe', None)
+            pred = (residual_probe.predict(infer_kwargs) if residual_probe is not None
+                    else model.infer_action(**infer_kwargs))
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -1066,6 +1068,15 @@ def run_single_episode(
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
+    residual_probe = None
+    if bool(cfg.EVALUATION.get('residual_sensitivity', False)):
+        from flexpi.models.helpers.residual_sensitivity import ResidualSensitivityProbe
+        channels = cfg.data.train.processor.action_state_merger.used_action_channel_ids
+        residual_probe = ResidualSensitivityProbe(model, cfg, episode_idx, channels)
+    model._residual_sensitivity_probe = residual_probe
+    execution_perturbation = getattr(model, '_execution_perturbation', None)
+    executed_actions = 0
+
     env.reset()
     obs = env.set_init_state(initial_state)
     if use_action_ensembler:
@@ -1113,6 +1124,8 @@ def run_single_episode(
             else:
                 current_predicted_future_clip = None
             current_replan_step = 0
+            if execution_perturbation is not None:
+                execution_perturbation.begin_chunk(action_chunk)
             if use_action_ensembler:
                 ensembler.add_actions(action_chunk, t)
                 pending_actions = [ensembler.get_action(ts).tolist() for ts in range(t, t + replan_steps)]
@@ -1123,7 +1136,17 @@ def run_single_episode(
             imgs = get_libero_image(obs)
             replay_images.append(imgs.copy())
 
-        obs, _, done, _ = env.step(pending_actions.pop(0))
+        executed_action = pending_actions.pop(0)
+        if execution_perturbation is not None:
+            executed_action = execution_perturbation.apply(executed_action)
+        obs, _, done, _ = env.step(executed_action)
+        executed_actions += 1
+        if residual_probe is not None:
+            def residual_image():
+                return _obs_to_model_input(obs, cfg=cfg, processor=processor,
+                    width=input_w, height=input_h, device=model_device,
+                    dtype=model.torch_dtype)[0]
+            residual_probe.observe(residual_image, done)
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
@@ -1179,6 +1202,12 @@ def run_single_episode(
         t += 1
     pbar.close()
 
+    if residual_probe is not None:
+        residual_probe.finish(done)
+    model._residual_sensitivity_probe = None
+    model._last_episode_execution = dict(executed_actions=executed_actions,
+        success=bool(done), success_by_96=bool(done and executed_actions <= 96))
+
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
@@ -1199,6 +1228,11 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
+    if bool(cfg.EVALUATION.get('paired_residual_experiment', False)):
+        from experiments.libero.paired_residual import run_paired_task
+        return run_paired_task(task, initial_states, model, processor, cfg, video_dir,
+            episode_fn=run_single_episode, action_horizon=action_horizon,
+            input_w=input_w, input_h=input_h, model_device=model_device)
     env, task_description = get_libero_env(
         task, LIBERO_ENV_RESOLUTION, cfg.get("seed"),
         camera_depths=_is_3d_eval(cfg),

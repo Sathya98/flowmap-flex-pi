@@ -19,8 +19,18 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10
+eval_nfes: []
+eval_fixed_indices: []
+eval_seed: 2026
+eval_namespace: eval
+eval_at_start: true
+eval_on_pause: false
+stop_after_steps: null
+max_runtime_seconds: 0
+fail_on_nonfinite: false
 keep_last_n_states: 3
 keep_last_n_weights: 3
+keep_weight_steps: []
 
 eval_video: true
 share_pca_basis: true
@@ -30,6 +40,7 @@ mixed_precision: "bf16"
 seed: 42
 max_grad_norm: 1.0
 weight_decay: 0.0
+fused_adamw: false
 resume: null
 resume_reanchor_lr_schedule: false
 resume_config_source: "current"
@@ -38,6 +49,8 @@ pretrained_ckpt: null
 pretrained_ckpt_strict_shape: false
 
 wandb:
+  isolated: false           # explicit per-job credentials or credential-free offline
+  id: null                  # persisted in output_dir/wandb_run.json for resuming
   enabled: false            # launchers pass WANDB_ENABLED through to here
   workspace: null
   project: flex-pi

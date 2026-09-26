@@ -1,4 +1,5 @@
 import torch
+from .checkpoint import checkpoint
 
 
 def create_custom_forward(module):
@@ -14,7 +15,7 @@ def gradient_checkpoint_forward(
     **kwargs,
 ):
     if use_gradient_checkpointing:
-        model_output = torch.utils.checkpoint.checkpoint(
+        model_output = checkpoint(
             create_custom_forward(model),
             *args,
             **kwargs,

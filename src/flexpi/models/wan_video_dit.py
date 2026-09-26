@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import math
 from typing import Any, Dict, Tuple, Optional
 from .helpers.gradient import gradient_checkpoint_forward
+from .helpers.attention import scaled_dot_product_attention
+from .helpers.normalization import ForwardADLayerNorm
 
 from flexpi.utils.logging_config import get_logger
 
@@ -23,7 +25,7 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
         # Legacy 2D [L, S] mask is left alone (SDPA accepts it directly).
         if ctx_mask is not None and ctx_mask.dim() == 3:
             ctx_mask = ctx_mask.unsqueeze(1)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
+        x = scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
         x = x.transpose(1, 2).reshape(B, S_q, -1)
         return x
     else:
@@ -156,6 +158,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
+    def reset_parameters(self):
+        nn.init.ones_(self.weight)
+
     def norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
@@ -244,9 +249,9 @@ class DiTBlock(nn.Module):
         self.self_attn = SelfAttention(hidden_dim, attn_head_dim, num_heads, eps)
         self.cross_attn = CrossAttention(
             hidden_dim, attn_head_dim, num_heads, eps)
-        self.norm1 = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(hidden_dim, eps=eps)
+        self.norm1 = ForwardADLayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
+        self.norm2 = ForwardADLayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
+        self.norm3 = ForwardADLayerNorm(hidden_dim, eps=eps)
         self.ffn = nn.Sequential(nn.Linear(hidden_dim, ffn_dim), nn.GELU(
             approximate='tanh'), nn.Linear(ffn_dim, hidden_dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
@@ -278,11 +283,11 @@ class MLP(torch.nn.Module):
     def __init__(self, in_dim, out_dim, has_pos_emb=False):
         super().__init__()
         self.proj = torch.nn.Sequential(
-            nn.LayerNorm(in_dim),
+            ForwardADLayerNorm(in_dim),
             nn.Linear(in_dim, in_dim),
             nn.GELU(),
             nn.Linear(in_dim, out_dim),
-            nn.LayerNorm(out_dim)
+            ForwardADLayerNorm(out_dim)
         )
         self.has_pos_emb = has_pos_emb
         if has_pos_emb:
@@ -299,7 +304,7 @@ class Head(nn.Module):
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm = ForwardADLayerNorm(dim, eps=eps, elementwise_affine=False)
         self.head = nn.Linear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
 
@@ -341,6 +346,7 @@ class WanVideoDiT(torch.nn.Module):
         action_group_causal_mask_mode = "causal",
         video_attention_mask_mode: str = "bidirectional",
         use_gradient_checkpointing: bool = False,
+        use_time_delta: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -384,6 +390,27 @@ class WanVideoDiT(torch.nn.Module):
         )
         self.time_projection = nn.Sequential(
             nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        # Flow-map second time input. Positional embedding of the jump
+        # Δ = t_target − t_input, ADDED to the `t` conditioning before
+        # `time_projection` (Boffi et al. 2025: embed s and (t−s), sum, FiLM).
+        # The final Linear is zero-init so an enabled-but-untrained map is
+        # byte-identical to the single-time flow-matching model; `None` when
+        # disabled so `embed_time` reduces exactly to the original path. All
+        # visual streams (video/dino/pointmap) share this module, as they
+        # already share `time_embedding`. Registered with the Wan2.2 loader
+        # automatically (it whitelists ctor kwargs) and tolerated by its
+        # strict=False weight load.
+        self.use_time_delta = bool(use_time_delta)
+        if self.use_time_delta:
+            self.time_embedding_delta = nn.Sequential(
+                nn.Linear(freq_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            nn.init.zeros_(self.time_embedding_delta[2].weight)
+            nn.init.zeros_(self.time_embedding_delta[2].bias)
+        else:
+            self.time_embedding_delta = None
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_dim, attn_head_dim, num_heads, ffn_dim, eps)
             for _ in range(num_layers)
@@ -515,6 +542,42 @@ class WanVideoDiT(torch.nn.Module):
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
 
+    def embed_time(
+        self,
+        timestep: torch.Tensor,
+        timestep_delta: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Time conditioning `t` [N, hidden] that feeds `time_projection` (AdaLN).
+
+        `timestep` is the (flattened, per-token) noise level of the *input* —
+        the flow-map start level s. When the Δ path is enabled,
+        `timestep_delta = t_target − t_input` (same units, signed, same shape)
+        is embedded positionally and ADDED; a missing Δ means Δ=0 (diagonal /
+        instantaneous velocity). Disabled ⇒ exactly the original path. Also
+        used by `FlexPi._build_stream_t_mod` for the DINO/pointmap tokens.
+        """
+        emb_dtype = self.time_embedding[0].weight.dtype
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(emb_dtype))
+        if self.time_embedding_delta is None:
+            return t
+        if timestep_delta is None:
+            timestep_delta = torch.zeros_like(timestep)
+        elif timestep_delta.shape != timestep.shape:
+            if timestep_delta.numel() == 1:
+                timestep_delta = timestep_delta.reshape(1).expand_as(timestep)
+            else:
+                raise ValueError(
+                    f"`timestep_delta` shape {tuple(timestep_delta.shape)} must match "
+                    f"`timestep` shape {tuple(timestep.shape)}"
+                )
+        delta_emb = sinusoidal_embedding_1d(self.freq_dim, timestep_delta).to(emb_dtype)
+        # Center the additional conditioning on the diagonal. This preserves
+        # the current single-time path, not frozen teacher weights after tuning.
+        zero_emb = sinusoidal_embedding_1d(
+            self.freq_dim, torch.zeros((1,), dtype=timestep.dtype, device=timestep.device),
+        )
+        return t + (self.time_embedding_delta(delta_emb) - self.time_embedding_delta(zero_emb.to(emb_dtype)))
+
     def pre_dit(
         self,
         x: torch.Tensor,
@@ -524,6 +587,7 @@ class WanVideoDiT(torch.nn.Module):
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
         control_camera_latents_input: Optional[torch.Tensor] = None,
+        timestep_delta: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         x, timestep, context_mask = self._validate_forward_inputs(
             x=x,
@@ -554,13 +618,27 @@ class WanVideoDiT(torch.nn.Module):
             ) * timestep.view(batch_size, 1, 1)
             token_timesteps[:, 0, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
-            token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
-            t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
+            # Flow-map Δ path: per-token jump broadcast per frame exactly like
+            # the timesteps, with the frame-0 clean anchor forced to Δ=0 (it is
+            # never jumped). Only built when the path is enabled so the
+            # disabled model stays byte-identical.
+            token_deltas = None
+            if self.time_embedding_delta is not None and timestep_delta is not None:
+                if timestep_delta.numel() == 1 and batch_size > 1:
+                    timestep_delta = timestep_delta.reshape(1).expand(batch_size)
+                token_deltas = torch.ones(
+                    (batch_size, x.shape[2], tokens_per_frame),
+                    dtype=timestep.dtype,
+                    device=timestep.device,
+                ) * timestep_delta.to(timestep.dtype).view(batch_size, 1, 1)
+                token_deltas[:, 0, :] = 0
+                token_deltas = token_deltas.reshape(-1)
+            t = self.embed_time(token_timesteps.reshape(-1), token_deltas).reshape(
+                batch_size, -1, self.hidden_dim,
+            )
             t_mod = self.time_projection(t).unflatten(2, (6, self.hidden_dim))
         else:
             raise NotImplementedError("Only support seperated_timestep with fuse_vae_embedding_in_latents for now.")
-            t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
-            t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
         x = self.patchify(x, control_camera_latents_input=control_camera_latents_input)
         f, h, w = x.shape[2:]
 
@@ -642,10 +720,12 @@ class WanVideoDiT(torch.nn.Module):
         context_mask: Optional[torch.Tensor] = None,
         action: Optional[torch.Tensor] = None,
         fuse_vae_embedding_in_latents: bool = False,
+        timestep_delta: Optional[torch.Tensor] = None,
     ):
         pre_state = self.pre_dit(
             x=x,
             timestep=timestep,
+            timestep_delta=timestep_delta,
             context=context,
             context_mask=context_mask,
             action=action,

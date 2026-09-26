@@ -122,12 +122,16 @@ def create_flexpi(
     # dino+3d+action, full joint, etc.) without re-instantiation. Default off
     # is bit-identical to the legacy joint behavior.
     flex_joint=None,
+    # Flow-map distillation / self-distillation config. Off by default => flow-matching baseline.
+    # When enabled, activates the Δ time-embedding (`use_time_delta`) on both experts.
+    flow_map=None,
     # Whether this run carries a pointmap (3D) stream. Requires a data config
     # that supplies depth; set False to train without it.
     enable_pointmap: bool = True,
 ):
     from .models.flexpi import FlexPi
     from .models.helpers.flex_joint import FlexJointConfig
+    from .models.helpers.flowmap import FlowMapConfig
 
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -194,12 +198,29 @@ def create_flexpi(
             flex_joint_dict = dict(flex_joint)
         flex_joint_obj = FlexJointConfig(**flex_joint_dict)
 
+    # Resolve flow_map config (Hydra DictConfig | dict | FlowMapConfig | None) and
+    # activate the Δ time-embedding on both experts when enabled. Off (default) =>
+    # use_time_delta=False => byte-identical to the flow-matching model.
+    if flow_map is None:
+        flow_map_obj = FlowMapConfig()
+    elif isinstance(flow_map, FlowMapConfig):
+        flow_map_obj = flow_map
+    else:
+        if isinstance(flow_map, DictConfig):
+            flow_map_dict = OmegaConf.to_container(flow_map, resolve=True)
+        else:
+            flow_map_dict = dict(flow_map)
+        flow_map_obj = FlowMapConfig(**flow_map_dict)
+    video_dit_config["use_time_delta"] = bool(flow_map_obj.enabled)
+    action_dit_config["use_time_delta"] = bool(flow_map_obj.enabled)
+
     return FlexPi.from_wan22_pretrained(
         enable_pointmap=bool(enable_pointmap),
         joint_video=bool(joint_video),
         joint_dino=bool(joint_dino),
         joint_pointmap=bool(joint_pointmap),
         flex_joint=flex_joint_obj,
+        flow_map=flow_map_obj,
         dino_dim=int(dino_dim),
         dino_model_name=str(dino_model_name),
         dino_train_shift=float(dino_scheduler.get("train_shift", 5.0)),
@@ -281,6 +302,24 @@ def build_datasets(data_cfg: DictConfig):
         logger.info("Building val dataset with pretrained_norm_stats: %s", pretrained_norm_stats)
         val_ds = instantiate(data_cfg.val, pretrained_norm_stats=pretrained_norm_stats)
     return train_ds, val_ds
+
+
+def wrap_latent_cache(cfg: DictConfig, train_ds, val_ds):
+    """Serve training batches from ``data.latent_cache_dir`` when it is set.
+
+    Eval keeps the raw dataset (previews need pixels). The cache must have been
+    built from the same data + encoder settings; any difference is an error.
+    """
+    cache_dir = cfg.data.get("latent_cache_dir")
+    if not cache_dir:
+        return train_ds, val_ds
+    from .datasets.latent_cache import CachedLatentDataset, LatentCache, encoder_fingerprint, fingerprint_diff
+    built = LatentCache.open(cache_dir).manifest["fingerprint"]
+    diff = fingerprint_diff(built, encoder_fingerprint(cfg))
+    if diff:
+        raise ValueError(f"Latent cache {cache_dir} was built with different settings: {diff}")
+    logger.info("Training from latent cache %s", cache_dir)
+    return CachedLatentDataset(cache_dir, train_ds), val_ds
 
 
 def _resolve_train_device() -> str:
@@ -426,6 +465,7 @@ def run_training(cfg: DictConfig):
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     train_ds, val_ds = build_datasets(cfg.data)
+    train_ds, val_ds = wrap_latent_cache(cfg, train_ds, val_ds)
 
     trainer = Wan22Trainer(
         cfg=cfg,

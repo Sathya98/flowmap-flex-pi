@@ -1,0 +1,29 @@
+# LMD full-grad with flex-joint regime sampling: per sample, each visual stream is
+# present with p=0.5 and each joint flag is on with p=0.5, with cross-modal prediction
+# (absent streams are still denoised from the others), exactly the recipe the released
+# LIBERO teacher was trained with (checkpoints/released/flexpi-libero/config.yaml). One
+# flow map then serves every inference regime (action-only ... full joint).
+# A separate arm from the full-joint main study (docs/FULL_JOINT_STUDY.md), which keeps
+# every stream present and joint. Budget/schedule inherited from flowmap_libero_lmd_full.
+defaults:
+  - flowmap_libero_lmd_full
+  - _self_
+output_dir: ${oc.env:FLOWMAP_RUN_DIR,./runs/flowmap_flex/libero_lmd_flex_manual}
+wandb:
+  name: libero-lmd-fullgrad-flex-s42
+  group: libero-lmd-fullgrad-flex
+model:
+  flex_joint:
+    enabled: true
+    p_present_video: 0.5
+    p_present_dino: 0.5
+    p_present_pointmap: 0.5
+    p_jv: 0.5
+    p_jd: 0.5
+    p_jp: 0.5
+    cross_modal_predict_video: true
+    cross_modal_predict_dino: true
+    cross_modal_predict_pointmap: true
+    # true: one regime per microbatch (one attention mask; batched fused-JVP calls
+    # at microbatch >= 2). Per-sample marginals are unchanged. Off = released recipe.
+    share_within_microbatch: false

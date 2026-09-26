@@ -1,0 +1,49 @@
+# Task-finetuned LIBERO -> full-joint LMD with teacher-input gradients.
+# Budget is provisional; this is not evidence of convergence.
+defaults:
+  - flowmap_libero_lmd_fullgrad_pilot
+  - _self_
+output_dir: ${oc.env:FLOWMAP_RUN_DIR,./runs/flowmap_fulljoint/libero_lmd_full_manual}
+max_steps: 2000
+batch_size: 1
+gradient_accumulation_steps: 48
+learning_rate: 1.0e-5
+fused_adamw: true
+num_workers: 4
+log_every: 1
+save_every: 250
+keep_last_n_states: 2
+keep_last_n_weights: 3
+keep_weight_steps: [2, 250, 500, 750, 1000, 1250, 1500, 1750, 2000]
+fail_on_nonfinite: true
+# Pause at an optimizer boundary and resume the SAME 2000-step LR schedule.
+max_runtime_seconds: 72000
+stop_after_steps: null
+# Training-set diagnostics; not independent benchmark validation.
+eval_every: 100
+eval_video: true
+eval_num_inference_steps: 2
+eval_nfes: [1, 2, 4]
+eval_namespace: train_preview
+eval_seed: 2026
+eval_at_start: false
+eval_on_pause: true
+# One clip from each suite, in dataset_dirs order. These are first-frame offsets.
+eval_fixed_indices: [0, 53128, 120437, 173332]
+wandb:
+  enabled: true
+  workspace: null
+  isolated: true
+  project: flowmap-flex-pi
+  name: libero-lmd-fullgrad-fulljoint-s42
+  group: libero-lmd-fullgrad
+  mode: offline
+model:
+  flow_map:
+    objective: lmd
+    lmd_teacher_gradient: full
+    dt_method: ad
+    detach_derivatives: false
+    distill_ema: true
+    distill_learned_time_weighting: false
+    teacher_checkpoint: ./checkpoints/released/flexpi-libero/checkpoints/weights/step_010860.pt

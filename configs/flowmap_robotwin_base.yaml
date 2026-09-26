@@ -1,0 +1,76 @@
+# RoboTwin 2.0 (50 tasks) flow-map base, initialised from the released RoboTwin
+# checkpoint. Infrastructure base like flowmap_libero_pfmm_smoke; study configs
+# inherit it and set the objective and budget.
+#
+# The released checkpoint predates the current RoboTwin task recipe, so its
+# geometry is pinned here rather than inherited (see docs/LATENT_CACHE.md):
+#   - legacy asymmetric camera layout (`robotwin` alias): 294 DINO tokens/frame
+#   - no DINO pixel-unshuffle: DINO layers are 768 wide, not 3072
+#   - DINO temporal stride 1: frames g, g+16, g+32
+#   - DINO head predicts velocity (dino_pred_x0 false). Its saved config names
+#     none of these keys, and eval swaps that config in verbatim, so the code
+#     defaults apply there; the model yaml's defaults differ.
+defaults:
+  - train
+  - override task: robotwin_unified_flex_3cam_384_1e-4
+  - _self_
+
+output_dir: ./runs/flowmap_pilots/robotwin_${oc.env:SLURM_JOB_ID,manual}
+pretrained_ckpt: ./checkpoints/released/flexpi-robotwin/checkpoints/weights/step_048060.pt
+pretrained_ckpt_strict_shape: true
+resume: null
+batch_size: 1
+gradient_accumulation_steps: 1
+num_workers: 2
+learning_rate: 1.0e-5
+max_steps: 50
+log_every: 1
+save_every: 0
+eval_every: 0
+eval_video: false
+keep_last_n_states: 1
+keep_last_n_weights: 1
+mixed_precision: bf16
+seed: 42
+wandb:
+  enabled: false
+
+data:
+  train:
+    # Train-set previews only, as in the LIBERO study; also lets the latent
+    # cache cover every episode.
+    val_set_proportion: 0.0
+    # Identical to the dataset's own stats; the task config's path is wrong.
+    pretrained_norm_stats: ./checkpoints/released/flexpi-robotwin/dataset_stats.json
+  val:
+    val_set_proportion: 0.0
+    pretrained_norm_stats: ./checkpoints/released/flexpi-robotwin/dataset_stats.json
+
+model:
+  composite_layout: tshape_robotwin_384x320
+  dino_pixel_unshuffle: 0
+  dino_temporal_stride: 1
+  dino_stride_keep_far: false
+  dino_pred_x0: false
+  mot_checkpoint_mixed_attn: true
+  enable_pointmap: true
+  joint_video: true
+  joint_dino: true
+  joint_pointmap: true
+  flex_joint:
+    enabled: false
+  flow_map:
+    enabled: true
+    objective: pfmm
+    pfmm_loss_space: velocity
+    lmd_teacher_gradient: detached
+    distill_learned_time_weighting: false
+    distill_ema: false
+    mode: full
+    initialization: pretrained
+    streams: [action, video, dino, pointmap]
+    teacher_checkpoint: ${pretrained_ckpt}
+    teacher_steps: 4
+    strip_width: 1.0
+    schedule_shift: 1.0
+    num_inference_steps: 2

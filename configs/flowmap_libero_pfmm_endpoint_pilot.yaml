@@ -1,0 +1,14 @@
+# Controlled 50-update implementation pilot; not a convergence budget.
+defaults:
+  - flowmap_libero_pfmm_accum_smoke
+  - _self_
+output_dir: ./runs/flowmap_pilots/libero_pfmm_endpoint_tw${model.flow_map.distill_learned_time_weighting}_${oc.env:SLURM_JOB_ID,manual}
+max_steps: 50
+save_every: 10
+keep_last_n_weights: 5
+keep_last_n_states: 2
+model:
+  flow_map:
+    objective: pfmm
+    pfmm_loss_space: endpoint
+    distill_ema: true

@@ -16,7 +16,7 @@ parameter container + sampling helper.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
@@ -47,6 +47,12 @@ class FlexJointConfig:
     cross_modal_predict_video: bool = False
     cross_modal_predict_dino: bool = False
     cross_modal_predict_pointmap: bool = False
+    # Draw ONE regime (all six flags) per microbatch and give it to every sample,
+    # so a microbatch shares one attention mask (one batched fused-JVP call per
+    # row group). Each sample's regime distribution is unchanged; only samples
+    # of the same microbatch become correlated (fewer independent regime draws
+    # per update). Off by default: the released recipe draws per sample.
+    share_within_microbatch: bool = False
 
     def __post_init__(self):
         for name in ("p_present_video", "p_present_dino", "p_present_pointmap", "p_jv", "p_jd", "p_jp"):
@@ -92,6 +98,9 @@ def sample_flex_batch_flags(
 ) -> FlexBatchFlags:
     """Draw per-sample flex flags for one training step.
 
+    With ``cfg.share_within_microbatch`` one sample's flags are drawn and
+    broadcast to the whole microbatch.
+
     Independent Bernoulli for each of: present_v, present_d, present_p, j_v, j_d, j_p.
     Joint flags are then AND-ed with (presence | cross_modal) so a flag
     pointing at an absent non-cross-modal stream collapses to False.
@@ -109,6 +118,11 @@ def sample_flex_batch_flags(
     anchor that does not exist. No-op when pointmap is off via the legacy
     ``p_present_pointmap=0, p_jp=0`` corner — those already produce all-False.
     """
+    if cfg.share_within_microbatch and batch_size > 1:
+        one = sample_flex_batch_flags(cfg, 1, device, generator=generator, pointmap_off=pointmap_off)
+        return replace(one, **{name: getattr(one, name).expand(batch_size).clone()
+                               for name in ("present_v", "present_d", "present_p", "j_v", "j_d", "j_p")})
+
     def _bern(p: float) -> torch.Tensor:
         if p >= 1.0:
             return torch.ones(batch_size, dtype=torch.bool, device=device)

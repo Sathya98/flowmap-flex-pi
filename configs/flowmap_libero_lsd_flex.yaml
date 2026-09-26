@@ -1,0 +1,17 @@
+# LSD self-distillation with flex-joint regime sampling (see flowmap_libero_lmd_flex).
+# Initialised from the released LIBERO checkpoint, not the AGIBOT checkpoint the main
+# study specifies for self-distillation (docs/FULL_JOINT_STUDY.md), which is not
+# available yet. No teacher: the target is the student's own diagonal. 75/25
+# diagonal/off-diagonal mixture, stratified per microstep (helpers/flowmap_self.py).
+defaults:
+  - flowmap_libero_lmd_flex
+  - _self_
+output_dir: ${oc.env:FLOWMAP_RUN_DIR,./runs/flowmap_flex/libero_lsd_flex_manual}
+wandb:
+  name: libero-lsd-flex-s42
+  group: libero-lsd-flex
+model:
+  flow_map:
+    objective: lsd
+    lmd_teacher_gradient: detached
+    teacher_checkpoint: null

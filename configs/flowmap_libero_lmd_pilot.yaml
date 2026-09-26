@@ -1,0 +1,15 @@
+# Matched full-joint LMD vs PFMM pilot; released LIBERO teacher and initialization.
+defaults:
+  - flowmap_libero_pfmm_accum_smoke
+  - _self_
+
+output_dir: ./runs/flowmap_pilots/libero_lmd_batch192_${oc.env:SLURM_JOB_ID,manual}
+max_steps: 50
+save_every: 10
+keep_last_n_weights: 5
+keep_last_n_states: 2
+model:
+  flow_map:
+    objective: lmd
+    dt_method: ad
+    detach_derivatives: false

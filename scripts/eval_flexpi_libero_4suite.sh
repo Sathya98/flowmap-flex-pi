@@ -20,8 +20,7 @@ cd "$(dirname "$0")/.."
 export PYTHONPATH="$(pwd)/third_party/LIBERO:$(pwd)/src:${PYTHONPATH:-}"
 export PYTHONNOUSERSITE=1
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
-# Let prepare_libero() derive the binding; an inherited value binds stale.
-unset LIBERO_CONFIG_PATH
+# Honor an explicit run-local binding; otherwise prepare_libero() derives it.
 
 [[ -f third_party/LIBERO/libero/libero/__init__.py ]] || {
   echo "ERROR: third_party/LIBERO is empty. Run:"
@@ -107,6 +106,7 @@ for gpu in "${GPU_ARR[@]}"; do
     "+EVALUATION.infer_joint_video=${INFER_JOINT_VIDEO}" \
     "+EVALUATION.infer_joint_dino=${INFER_JOINT_DINO}" \
     "+EVALUATION.infer_joint_pointmap=${INFER_JOINT_POINTMAP}" \
+    "$@" \
     > "$OUTPUT_DIR/gpu${gpu}.log" 2>&1 &
   pids+=($!)
   echo "[4suite] gpu${gpu}: $(wc -l < "$shard") tasks -> $OUTPUT_DIR/gpu${gpu}.log (pid $!)"

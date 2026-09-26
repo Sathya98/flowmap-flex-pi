@@ -151,3 +151,45 @@ class WanContinuousFlowMatchScheduler:
         self._ms_prev_x0 = x0
         self._ms_prev_h = h
         return x_next
+
+
+class FlowMapScheduler(WanContinuousFlowMatchScheduler):
+    """Inference scheduler for a two-time flow map over the SAME rectified-flow path.
+
+    A K-step flow map takes K large jumps instead of many small Euler steps. Because
+    rectified flow gives ``dx/dσ = v``, a jump and an Euler step are the *same* update
+    ``x + v·δ`` — so this class reuses the parent's ``_phi`` / ``add_noise`` /
+    ``build_inference_schedule`` / ``step`` unchanged. The only new thing a flow map
+    needs is that each head evaluation is conditioned on BOTH the start level ``s`` and
+    the jump ``Δ = t − s`` (in timestep units); ``build_flow_map_schedule`` returns that
+    Δ alongside the usual ``(timesteps, deltas)``.
+
+    Per step k of a K-step rollout (σ runs 1 -> 0):
+
+        v = head(x, timestep=timesteps[k], timestep_delta=timestep_deltas[k])
+        x = self.step(v, deltas[k], x)          # parent Euler jump
+
+    ``num_inference_steps=1`` gives a single noise->clean jump; the FM Euler path
+    velocity is recovered by querying the head at Δ=0. The map at Δ=0 is
+    the identity. FlexPi uses ``FlowMapConfig.inference_nodes`` to enforce a
+    shared schedule and training-strip coverage across all generated streams.
+    """
+
+    def build_flow_map_schedule(
+        self,
+        num_inference_steps: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        shift_override: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(timesteps, deltas, timestep_deltas)`` for a K-step flow-map rollout.
+
+        ``timesteps`` and ``deltas`` are exactly the parent inference schedule (``deltas``
+        stay in σ units for the Euler ``step``). ``timestep_deltas = deltas · N`` is the
+        signed jump Δ each head eval embeds (negative, since σ decreases toward clean).
+        """
+        timesteps, deltas = self.build_inference_schedule(
+            num_inference_steps, device, torch.float32, shift_override=shift_override,
+        )
+        timestep_deltas = deltas * float(self.num_train_timesteps)
+        return timesteps, deltas, timestep_deltas

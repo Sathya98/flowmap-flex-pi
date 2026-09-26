@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from .wan_video_dit import flash_attention, modulate, rope_apply
+from .helpers.checkpoint import checkpoint
 from flexpi.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -198,7 +199,7 @@ class MoT(nn.Module):
                 return out
 
             if self.mot_checkpoint_mixed_attn and self.training:
-                return torch.utils.checkpoint.checkpoint(
+                return checkpoint(
                     _forward_flex, q_cat, k_cat, v_cat, use_reentrant=False,
                 )
             return _forward_flex(q_cat, k_cat, v_cat)
@@ -213,7 +214,7 @@ class MoT(nn.Module):
             return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attn_mask)
 
         if self.mot_checkpoint_mixed_attn and self.training:
-            return torch.utils.checkpoint.checkpoint(
+            return checkpoint(
                 _forward,
                 q_cat,
                 k_cat,
@@ -361,7 +362,7 @@ class MoT(nn.Module):
             )
 
         if use_gradient_checkpointing and self.training:
-            return torch.utils.checkpoint.checkpoint(
+            return checkpoint(
                 _post_fn,
                 mixed_slice,
                 residual_x,

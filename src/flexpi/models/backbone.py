@@ -293,6 +293,12 @@ class FlexPiBackbone(torch.nn.Module):
                 targets is only ~3%). Retained for the non-engine compiled path
                 / a future capturable engine.
         """
+        if getattr(getattr(self, "flow_map", None), "enabled", False):
+            if (torch_compile or quantization or trt_joint_engine_path or trt_prefill_engine_path
+                    or trt_joint_prefill_split_engine_path or trt_joint_decode_split_engine_path
+                    or joint_loop_cuda_graph or solver != "euler"):
+                raise ValueError("Flow maps currently use eager two-time inference. Disable legacy compile/TRT/quantization/loop graphs and use solver=euler.")
+
         if torch_compile_scope not in ("step", "loop"):
             raise ValueError(
                 f"`torch_compile_scope` must be 'step' or 'loop', got {torch_compile_scope!r}"
@@ -1417,6 +1423,7 @@ class FlexPiBackbone(torch.nn.Module):
         video_kv_cache: list[dict[str, torch.Tensor]],
         attention_mask: torch.Tensor,
         video_seq_len: int,
+        timestep_delta_action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Action-velocity prediction without ``@torch.no_grad()``.
 
@@ -1427,6 +1434,7 @@ class FlexPiBackbone(torch.nn.Module):
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
+            timestep_delta=timestep_delta_action,
             context=context,
             context_mask=context_mask,
         )
@@ -1482,8 +1490,8 @@ class FlexPiBackbone(torch.nn.Module):
             logger.warning(msg)
         return filtered, skipped
 
-    def load_checkpoint(self, path, optimizer=None, strict_shape: bool = True):
-        payload = torch.load(path, map_location="cpu")
+    def load_checkpoint(self, path, optimizer=None, strict_shape: bool = True, _payload=None):
+        payload = torch.load(path, map_location="cpu") if _payload is None else _payload
         if "mot" in payload:
             filtered, _ = self._filter_shape_mismatches(
                 payload["mot"], self.mot.state_dict(), label="mot",

@@ -21,6 +21,7 @@ from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler, WeightedResumableEpochSampler
+from .utils.update_metrics import UpdateLossMetrics
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 
@@ -59,6 +60,15 @@ class Wan22Trainer:
         # (model.infer) + VAE-recon viz + mp4, keeping val-loss. Lean eval for
         # FlexPi's no-test-time-video deployment. Default True = full eval.
         self.eval_video = bool(getattr(cfg, "eval_video", True))
+        self.eval_nfes = list(getattr(cfg, "eval_nfes", []) or [])
+        self.eval_fixed_indices = list(getattr(cfg, "eval_fixed_indices", []) or [])
+        self.eval_seed = int(getattr(cfg, "eval_seed", 2026))
+        self.eval_namespace = str(getattr(cfg, "eval_namespace", "eval"))
+        self.eval_at_start = bool(getattr(cfg, "eval_at_start", True))
+        self.eval_on_pause = bool(getattr(cfg, "eval_on_pause", False))
+        self.stop_after_steps = getattr(cfg, "stop_after_steps", None)
+        self.max_runtime_seconds = float(getattr(cfg, "max_runtime_seconds", 0) or 0)
+        self.fail_on_nonfinite = bool(getattr(cfg, "fail_on_nonfinite", False))
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
@@ -91,9 +101,33 @@ class Wan22Trainer:
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
         )
+        flow = getattr(self.model, "flow_map", None)
+        if flow is not None and flow.enabled:
+            # Preserve the effective batch across epoch ends, including external
+            # distillation. Self-distillation additionally needs its 75/25 mixture.
+            from accelerate.utils import GradientAccumulationPlugin
+            _accel_kwargs.pop("gradient_accumulation_steps")
+            _accel_kwargs["gradient_accumulation_plugin"] = GradientAccumulationPlugin(
+                num_steps=self.gradient_accumulation_steps, sync_with_dataloader=False)
         self.accelerator = Accelerator(**_accel_kwargs)
         
         ds_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if ds_plugin is not None:
+            # Accelerator.clip_grad_norm_ only reports the norm under DeepSpeed.
+            # An omitted JSON key defaults to zero (no clipping), so propagate
+            # the trainer setting before DeepSpeed constructs its optimizer.
+            ds_plugin.deepspeed_config["gradient_clipping"] = self.max_grad_norm
+            ds_plugin.gradient_clipping = self.max_grad_norm
+            # DeepSpeed 0.18 rescans every parameter in every ZeRO grad hook
+            # (~13 s per microstep here); cache it per backward. See module doc.
+            from .utils.deepspeed_compat import patch_zero_hook_count
+            import deepspeed
+            if patch_zero_hook_count():
+                logger.info("Patched DeepSpeed %s ZeRO hook parameter count (cached per backward).",
+                            deepspeed.__version__)
+            else:
+                logger.info("DeepSpeed %s: ZeRO hook count patch not applied (upstream fix or disabled).",
+                            deepspeed.__version__)
         zero_stage = (
             ds_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown")
             if ds_plugin is not None else "N/A"
@@ -117,6 +151,11 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules (VAE, text encoder) before optimizer/deepspeed initialization.
         # _apply_dit_only_train_mode unfreezes dit + any model-specific trainable layers.
+        # ZeRO creates independent FP32 master weights during prepare(). Loading
+        # only the module afterwards leaves those masters stale: the first
+        # optimizer step can overwrite the requested pretrained initialization.
+        self._load_initial_weights_before_prepare()
+        self._prepare_flowmap_teacher()
         self._apply_dit_only_train_mode(self.model)
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = self._build_optimizer(trainable_params)
@@ -154,12 +193,59 @@ class Wan22Trainer:
         )
         self.optimizer.zero_grad(set_to_none=True)
 
+        self.flowmap_ema = None
+        self._flowmap_microstep = 0
+        self._initialize_flowmap_ema()
         self.wandb_run = None
         self._init_wandb()
         self._resume_or_load_checkpoint()
 
         val_size = len(self.val_dataset) if self.val_dataset is not None else len(self.train_dataset)
         logger.info("Train/val dataset size: %d/%d", len(self.train_dataset), val_size)
+
+    def _initialize_flowmap_ema(self):
+        """Evaluation-only EMA for the configured training family, after prepare."""
+        self.flowmap_ema = None
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        flow = getattr(unwrapped, "flow_map", None)
+        if flow is not None and flow.uses_ema:
+            plugin = self.accelerator.state.deepspeed_plugin
+            if plugin is not None and plugin.deepspeed_config.get("zero_optimization", {}).get("stage") == 3:
+                raise ValueError("Flow-map CPU EMA requires replicated parameters (DDP or ZeRO-2)")
+            if self.accelerator.is_main_process:
+                from .utils.flowmap_ema import EvaluationEMA
+                # FLEXPI_EMA_BACKGROUND=0/1 forces the synchronous/background fold (A/B timing).
+                background = {"0": False, "1": True}.get(os.environ.get("FLEXPI_EMA_BACKGROUND", ""))
+                self.flowmap_ema = EvaluationEMA(unwrapped, flow.ema_decays, background=background)
+
+    def _prepare_flowmap_teacher(self):
+        model = self.model
+        flow = getattr(model, "flow_map", None)
+        if flow is None or not flow.enabled:
+            return
+        if flow.initialization == "random" and self.pretrained_ckpt:
+            raise ValueError("Random denoisers cannot also load pretrained_ckpt; use resume only to continue a scratch run")
+        if "video" not in flow.streams:
+            self.eval_video = False
+        if not flow.needs_teacher:
+            return
+        source = flow.teacher_checkpoint or self.pretrained_ckpt
+        if source is None:
+            raise ValueError("Distillation needs model.flow_map.teacher_checkpoint (or pretrained_ckpt). Resume alone cannot identify a frozen FM teacher.")
+        path = self._resolve_pretrained_ckpt_path(source)
+        # Frozen encoders can be shared, but every teacher denoiser/conditioning
+        # weight is an independent copy. Keep the teacher OUTSIDE the student
+        # module tree so DDP/ZeRO/optimizer/checkpoints cannot capture it.
+        from flexpi.models.helpers.adaptation import clone_teacher, validate_teacher_payload
+        teacher = clone_teacher(model)
+        payload = teacher.load_checkpoint(str(path), strict_shape=True)
+        validate_teacher_payload(teacher, payload)
+        del payload
+        teacher.to(self.accelerator.device)
+        teacher.device = self.accelerator.device
+        teacher.eval().requires_grad_(False)
+        object.__setattr__(model, "flow_map_teacher", teacher)
+        logger.info("Frozen flow-matching teacher: %s", path)
 
     def _build_optimizer(self, trainable_params):
         adam_betas = tuple(getattr(self.cfg, "adam_betas", [0.9, 0.95]))
@@ -172,11 +258,17 @@ class Wan22Trainer:
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
             betas=adam_betas,
+            fused=bool(getattr(self.cfg, "fused_adamw", False)) and self.accelerator.device.type == "cuda",
         )
 
     def _init_wandb(self):
         if not self.wandb_enabled or not self.accelerator.is_main_process:
             return
+        mode = str(self.cfg.wandb.mode)
+        flowmap_enabled = bool(OmegaConf.select(self.cfg, 'model.flow_map.enabled', default=False))
+        if flowmap_enabled or self.cfg.wandb.get('isolated', False):
+            from .utils.isolated_tracking import isolate_wandb
+            isolate_wandb(self.output_dir, mode, self.cfg.wandb.workspace)
         try:
             import wandb
         except ImportError as e:
@@ -184,14 +276,35 @@ class Wan22Trainer:
                 "wandb logging is enabled in config (`wandb.enabled=true`) but wandb is not installed."
             ) from e
 
+        identity_path = Path(self.output_dir) / "wandb_run.json"
+        identity = json.loads(identity_path.read_text()) if identity_path.exists() else {}
+        run_id = self.cfg.wandb.get("id") or identity.get("id") or wandb.util.generate_id()
+        if identity and (identity.get("id") != run_id
+                         or identity.get("project") != self.cfg.wandb.project
+                         or identity.get("entity") != self.cfg.wandb.workspace):
+            raise ValueError("W&B run identity changed within an existing output directory")
+        from .utils.tracking_config import tracking_config
         self.wandb_run = wandb.init(
+            id=run_id,
+            resume="allow" if mode == 'online' else None,
+            config=tracking_config(self.cfg),
+            allow_val_change=True,
             entity=self.cfg.wandb.workspace,
             project=self.cfg.wandb.project,
             name=self.cfg.wandb.name,
             group=None if self.cfg.wandb.group in (None, "null", "") else str(self.cfg.wandb.group),
-            mode=self.cfg.wandb.mode,
+            mode=mode,
             dir=self.output_dir,
+            settings=wandb.Settings(disable_code=True, disable_git=True,
+                                    x_disable_meta=True, x_disable_machine_info=True),
         )
+        self.wandb_run.define_metric("optimizer_step")
+        for prefix in ("train/*", "performance/*", "eval/*", "train_preview/*"):
+            self.wandb_run.define_metric(prefix, step_metric="optimizer_step")
+        url = self.wandb_run.url if mode == 'online' else None
+        identity_path.write_text(json.dumps(dict(id=run_id, project=self.cfg.wandb.project,
+            entity=self.cfg.wandb.workspace, mode=mode, url=url), indent=2) + "\n")
+        logger.info("W&B %s logging: %s", mode, url or self.output_dir)
         logger.info(
             "Initialized wandb run: workspace=%s project=%s name=%s",
             self.cfg.wandb.workspace,
@@ -202,10 +315,10 @@ class Wan22Trainer:
     def _wandb_log(self, payload: dict):
         if self.wandb_run is None:
             return
-        self.wandb_run.log(payload, step=self.global_step)
+        self.wandb_run.log(dict(payload, optimizer_step=self.global_step))
 
     def _finish_wandb(self):
-        if self.wandb_run is None:
+        if getattr(self, "wandb_run", None) is None:
             return
         self.wandb_run.finish()
         self.wandb_run = None
@@ -290,6 +403,12 @@ class Wan22Trainer:
         num_processes = max(int(self.accelerator.num_processes), 1)
         global_batch_size = max(self.batch_size * num_processes, 1)
         micro_steps_per_epoch = max(ceil(epoch_len / global_batch_size), 1)
+        flow = getattr(self.model, "flow_map", None)
+        if flow is not None and flow.enabled:
+            # This recipe accumulates across epoch boundaries, rather than
+            # rounding up each epoch separately.
+            return max(ceil(micro_steps_per_epoch * self.num_epochs /
+                            self.gradient_accumulation_steps), 1)
         opt_steps_per_epoch = max(
             ceil(micro_steps_per_epoch / self.gradient_accumulation_steps),
             1,
@@ -333,6 +452,31 @@ class Wan22Trainer:
         eta_m, eta_s = divmod(eta_rem, 60)
         return f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}", steps_per_sec
 
+    def _load_initial_weights_before_prepare(self):
+        """Load weight-only initialization before optimizer/master-weight creation."""
+        self._initial_weights_loaded = False
+        if self.resume:
+            path = Path(str(self.resume))
+            if not path.exists():
+                raise FileNotFoundError(f'Resume checkpoint not found: {path}')
+            if path.is_dir():
+                return  # full optimizer/shard restore must happen after prepare
+            logger.info('Loading weight-only resume before optimizer initialization: %s', path)
+            self.model.load_checkpoint(str(path), optimizer=None)
+            logger.warning('Weight-only resume starts a fresh optimizer/scheduler/step.')
+        elif self.pretrained_ckpt:
+            flow = getattr(self.model, 'flow_map', None)
+            if flow is not None and flow.enabled and flow.initialization == 'random':
+                raise ValueError('Random denoisers cannot also load pretrained_ckpt')
+            path = self._resolve_pretrained_ckpt_path(self.pretrained_ckpt)
+            logger.info('Loading pretrained weights BEFORE optimizer/master initialization: %s', path)
+            self.model.load_checkpoint(str(path), optimizer=None,
+                                       strict_shape=self.pretrained_ckpt_strict_shape)
+        else:
+            return
+        self._check_pretrain_norm_mode_compat(path)
+        self._initial_weights_loaded = True
+
     def _resume_or_load_checkpoint(self):
         resume = self.resume
         if resume:
@@ -343,26 +487,8 @@ class Wan22Trainer:
                 if getattr(self.cfg, "resume_reanchor_lr_schedule", False):
                     self._reanchor_lr_schedule()
                 return
-            if not resume_path.exists():
-                raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
-            logger.info("Loading weight checkpoint only: %s", resume)
-            self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
-            logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
-            self._check_pretrain_norm_mode_compat(resume_path)
-            return
-
-        if self.pretrained_ckpt:
-            pt_path = self._resolve_pretrained_ckpt_path(self.pretrained_ckpt)
-            logger.info(
-                "Loading pretrained weights (warm-init, fresh optimizer/scheduler/step): %s",
-                pt_path,
-            )
-            self.accelerator.unwrap_model(self.model).load_checkpoint(
-                str(pt_path),
-                optimizer=None,
-                strict_shape=self.pretrained_ckpt_strict_shape,
-            )
-            self._check_pretrain_norm_mode_compat(pt_path)
+        if (resume or self.pretrained_ckpt) and not getattr(self, '_initial_weights_loaded', False):
+            raise RuntimeError('Weight-only initialization must be loaded before accelerator.prepare()')
 
     @staticmethod
     def _resolve_pretrained_ckpt_path(raw: str) -> Path:
@@ -545,6 +671,11 @@ class Wan22Trainer:
     def _apply_dit_only_train_mode(model):
         # Frozen: large pretrained modules declared in model.FROZEN_MODULES.
         # Trainable: everything else (dit, proprio_encoder, _state_proj, dino layers, etc.)
+        flow = getattr(model, "flow_map", None)
+        if flow is not None and flow.enabled:
+            from .models.helpers.adaptation import configure_trainable
+            configure_trainable(model)
+            return
         frozen = getattr(model, "FROZEN_MODULES", {"vae", "text_encoder"})
         model.eval()
         model.requires_grad_(False)
@@ -724,7 +855,15 @@ class Wan22Trainer:
         return out
 
     def _run_eval_and_log(self):
-        metrics = self.evaluate()
+        from .utils.evaluation_rng import evaluation_rng
+        nfes = getattr(self, "eval_nfes", []) or [self.eval_num_inference_steps]
+        for nfe in nfes:
+            with evaluation_rng(getattr(self, "eval_seed", 2026) + self.accelerator.process_index,
+                                self.accelerator.device):
+                metrics = self.evaluate(num_inference_steps=int(nfe))
+            self._log_eval_metrics(metrics, int(nfe))
+
+    def _log_eval_metrics(self, metrics, nfe):
         self.accelerator.wait_for_everyone()
         if metrics is None or not self.accelerator.is_main_process:
             return
@@ -763,7 +902,8 @@ class Wan22Trainer:
             eval_payload["eval/action_l2"] = float(metrics["action_l2"])
         if "action_l1" in metrics:
             eval_payload["eval/action_l1"] = float(metrics["action_l1"])
-        if metrics.get("video_path") and os.path.isfile(metrics["video_path"]):
+        if (getattr(self, "wandb_run", None) is not None and metrics.get("video_path")
+                and os.path.isfile(metrics["video_path"])):
             import wandb
             has_dino = "dino_mse" in metrics
             has_pointmap = bool(metrics.get("has_pointmap"))
@@ -778,15 +918,26 @@ class Wan22Trainer:
             caption = f"step {self.global_step} | " + " | ".join(
                 f"row{i}: {d}" for i, d in enumerate(row_descs, 1)
             )
-            eval_payload["eval/video"] = wandb.Video(
-                metrics["video_path"], caption=caption,
-            )
+            for rank in range(self.accelerator.num_processes):
+                path = metrics["video_path"].replace("rank_000", f"rank_{rank:03d}")
+                if os.path.isfile(path):
+                    eval_payload[f"eval/video_rank_{rank}"] = wandb.Video(
+                        path, caption=f"{caption} | raw weights | NFE={nfe} | case rank={rank}")
         if "dino_mse" in metrics:
             eval_payload["eval/dino_mse"] = float(metrics["dino_mse"])
+        namespace = getattr(self, "eval_namespace", "eval")
+        eval_payload = {key.replace("eval/", f"{namespace}/nfe_{nfe}/", 1): value
+                        for key, value in eval_payload.items()}
+        eval_payload[f"{namespace}/nfe_{nfe}/weights"] = "raw"
+        eval_payload[f"{namespace}/nfe_{nfe}/sample_index"] = metrics.get("sample_index", -1)
         self._wandb_log(eval_payload)
+        # Preserve metrics and local preview paths independently of W&B.
+        with open(Path(self.output_dir) / 'preview_metrics.jsonl', 'a') as handle:
+            handle.write(json.dumps(dict(step=self.global_step, nfe=nfe,
+                namespace=namespace, weights='raw', **metrics)) + '\n')
 
     @torch.no_grad()
-    def evaluate(self):
+    def evaluate(self, num_inference_steps=None):
         if self.val_dataset is None:
             return None
 
@@ -795,8 +946,17 @@ class Wan22Trainer:
         model.eval()
 
         # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
+        indices = getattr(self, "eval_fixed_indices", [])
+        if indices:
+            if len(indices) < self.accelerator.num_processes:
+                raise ValueError("Fixed preview panel needs at least one index per rank")
+            eval_index = int(indices[self.accelerator.process_index])
+            if not 0 <= eval_index < len(self.val_dataset):
+                raise ValueError("Fixed preview index is outside the dataset")
+        else:
+            rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
+            eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
+        num_inference_steps = self.eval_num_inference_steps if num_inference_steps is None else num_inference_steps
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index], model=model)
 
         # 1. training loss
@@ -829,7 +989,7 @@ class Wan22Trainer:
             "proprio": proprio,
             "text_cfg_scale": 1.0,
             "action_cfg_scale": 1.0,
-            "num_inference_steps": self.eval_num_inference_steps,
+            "num_inference_steps": num_inference_steps,
             "seed": 42,
             "tiled": False,
         }
@@ -1030,7 +1190,7 @@ class Wan22Trainer:
 
         video_path = os.path.join(
             self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            f"step_{self.global_step:06d}_nfe_{num_inference_steps}_rank_{self.accelerator.process_index:03d}.mp4",
         )
         # DINO + VAE latent visualization — combine with video into single stitched output
         dino_mse = None
@@ -1330,6 +1490,7 @@ class Wan22Trainer:
             self._set_dit_only_train_mode()
 
         result = {
+            "sample_index": eval_index,
             "val_loss": float(mean_metrics[0].item()),
             "psnr_rg": float(mean_metrics[1].item()),
             "ssim_rg": float(mean_metrics[2].item()),
@@ -1353,15 +1514,29 @@ class Wan22Trainer:
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
         model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        ema = getattr(self, "flowmap_ema", None)
+        if ema is not None:
+            for decay in ema.decays:
+                directory = os.path.join(self.weights_dir, f"ema_{decay}")
+                ensure_dir(directory)
+                with ema.apply(model, decay):
+                    model.save_checkpoint(os.path.join(directory, f"{step_tag}.pt"),
+                                          optimizer=None, step=self.global_step)
         return ckpt_path
 
     def _save_trainer_state(self, state_path: str):
+        ema = getattr(self, "flowmap_ema", None)
+        if ema is not None:
+            torch.save(ema.state_dict(), os.path.join(state_path, "flowmap_ema.pt"))
         state_file = os.path.join(state_path, "trainer_state.json")
         payload = {
             "global_step": int(self.global_step),
+            "max_steps": int(self.max_steps),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
         }
+        if ema is not None:
+            payload["flowmap_ema_updates"] = ema.updates
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
 
@@ -1402,6 +1577,8 @@ class Wan22Trainer:
                            self.global_step, type(e).__name__, e)
         self.accelerator.wait_for_everyone()
 
+        save_ok = bool(self.accelerator.gather(torch.tensor(
+            [int(save_ok)], device=self.accelerator.device)).min().item())
         if self.accelerator.is_main_process:
             if save_ok:
                 # Full-state dirs hold sharded optimizer + grads + weights (tens of
@@ -1414,7 +1591,9 @@ class Wan22Trainer:
             else:
                 logger.warning("[ckpt] discarding partial checkpoint step=%d and continuing training",
                                self.global_step)
-                for p in (state_path, os.path.join(self.weights_dir, f"{step_tag}.pt")):
+                partial_paths = [state_path, os.path.join(self.weights_dir, f"{step_tag}.pt")]
+                partial_paths.extend(str(p) for p in Path(self.weights_dir).glob(f"ema_*/{step_tag}.pt"))
+                for p in partial_paths:
                     if os.path.isdir(p):
                         shutil.rmtree(p, ignore_errors=True)
                     elif os.path.exists(p):
@@ -1449,7 +1628,15 @@ class Wan22Trainer:
             for e in os.scandir(self.weights_dir)
             if e.is_file() and (m := re.fullmatch(r"step_(\d+)\.pt", e.name))
         ]
+        protected = set(int(step) for step in getattr(self.cfg, "keep_weight_steps", []))
+        for directory in Path(self.weights_dir).glob("ema_*"):
+            if directory.is_dir():
+                for stale in sorted(directory.glob("step_*.pt"))[:-keep]:
+                    if int(stale.stem.removeprefix("step_")) not in protected:
+                        stale.unlink()
         for _step, path in sorted(entries)[:-keep]:
+            if _step in protected:
+                continue
             try:
                 os.remove(path)
             except OSError:
@@ -1457,6 +1644,10 @@ class Wan22Trainer:
 
     def load_training_state(self, state_dir: str):
         self.accelerator.load_state(input_dir=state_dir)
+        ema = getattr(self, "flowmap_ema", None)
+        if ema is not None:
+            ema.load_state_dict(torch.load(Path(state_dir) / "flowmap_ema.pt",
+                                           map_location="cpu", weights_only=True, mmap=True))
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
@@ -1509,6 +1700,30 @@ class Wan22Trainer:
             state_file,
         )
 
+    def _pause_due(self):
+        stop = getattr(self, "stop_after_steps", None)
+        due = (stop is not None and self.global_step >= int(stop)) or (Path(self.output_dir) / "STOP").exists()
+        limit = getattr(self, "max_runtime_seconds", 0)
+        if limit:
+            local_due = due or time.perf_counter() - self.run_start_time >= limit
+            # All ranks pause at the same completed optimizer update.
+            flags = self.accelerator.gather(torch.tensor(
+                [int(local_due)], device=self.accelerator.device))
+            due = due or bool(flags.max().item())
+        return due
+
+    def _finish_segment(self, checkpoint, complete):
+        if not checkpoint.get("state_path"):
+            raise RuntimeError("Cannot finish a segment without a successful full-state checkpoint")
+        if self.accelerator.is_main_process:
+            status = dict(step=self.global_step, max_steps=self.max_steps,
+                          complete=complete, **checkpoint)
+            (Path(self.output_dir) / 'segment_status.json').write_text(json.dumps(status, indent=2) + '\n')
+            run = getattr(self, "wandb_run", None)
+            if run is not None:
+                run.summary.update(dict(optimizer_step=self.global_step, training_complete=complete))
+        self._finish_wandb()
+
     def train(self):
         self._set_dit_only_train_mode()
 
@@ -1526,6 +1741,7 @@ class Wan22Trainer:
             self.eval_every > 0
             and self.val_dataset is not None
             and self.global_step == 0
+            and getattr(self, "eval_at_start", True)
         ):
             self._run_eval_and_log()
 
@@ -1534,10 +1750,103 @@ class Wan22Trainer:
         # Emits when wait > FLEXPI_DL_TIMING_THRESHOLD_MS. No-op otherwise.
         _dl_timing = os.environ.get("FLEXPI_DL_TIMING") == "1"
         _dl_threshold_ms = float(os.environ.get("FLEXPI_DL_TIMING_THRESHOLD_MS", "2000"))
+        update_metrics = UpdateLossMetrics()
+        # STEPTIMING harness — env-gated, no-op unless FLEXPI_STEP_TIMING=1.
+        # Synchronizes the GPU at each phase boundary and prints one line per
+        # microstep: data wait, forward (incl. any JVP), backward (incl. ZeRO
+        # gradient reduction) and everything after it until the next microstep
+        # (optimizer step, EMA, logging). FLEXPI_STEP_TIMING_MAX_MICROSTEPS=N
+        # exits after N microsteps without a final checkpoint (timing runs only).
+        _st = os.environ.get("FLEXPI_STEP_TIMING") == "1"
+        _st_max = int(os.environ.get("FLEXPI_STEP_TIMING_MAX_MICROSTEPS", "0"))
+        # FLEXPI_STEP_PROFILE_MICRO=N: torch.profiler over microstep N (rank 0,
+        # data fetch through backward); tables go to <output_dir>/step_profile_*.txt.
+        _st_prof_micro = int(os.environ.get("FLEXPI_STEP_PROFILE_MICRO", "0"))
+        # FLEXPI_STEP_PROFILE_UPDATE=N: torch.profiler over the last microstep of
+        # update N through the end of its post-update work (rank 0). Both profiles
+        # also write <tag>_summary.json: GPU busy time, kernel/launch counts and,
+        # with FLEXPI_STEP_SYNC_DEBUG=1, host-sync call sites.
+        _st_prof_update = int(os.environ.get("FLEXPI_STEP_PROFILE_UPDATE", "0"))
+        _st_sync_debug = os.environ.get("FLEXPI_STEP_SYNC_DEBUG") == "1"
+        _st_n, _st_prev, _st_prof, _st_prof_tag, _st_sync = 0, None, None, None, None
+        _st_phases = {}
+
+        def _st_mark():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter()
+
+        def _st_prof_finish():
+            from .utils.step_profile import trace_summary, write_report
+            _st_prof.__exit__(None, None, None)
+            if _st_sync is not None:
+                _st_sync.__exit__(None, None, None)
+            events = _st_prof.key_averages()
+            for key in ("self_device_time_total", "self_cpu_time_total", "cpu_time_total"):
+                (Path(self.output_dir) / f"{_st_prof_tag}_{key}.txt").write_text(
+                    events.table(sort_by=key, row_limit=60))
+            trace = Path(self.output_dir) / f"{_st_prof_tag}_trace.json"
+            _st_prof.export_chrome_trace(str(trace))
+            report = write_report(self.output_dir, f"{_st_prof_tag}_summary", trace=trace_summary(trace),
+                                  syncs=None if _st_sync is None else _st_sync.report())
+            print(f"[STEPTIMING] {_st_prof_tag} -> {report}", flush=True)
+
+        def _st_phase(name):
+            # Synced sub-phase timing of the update boundary (timing runs only).
+            if _st:
+                now = _st_mark()
+                _st_phases[name] = (now - _st_phases.pop("_last", now)) * 1e3
+                _st_phases["_last"] = now
+
+        if _st and getattr(self.accelerator, "deepspeed_engine_wrapped", None) is not None:
+            _ds_engine = self.accelerator.deepspeed_engine_wrapped.engine
+            _ds_step = _ds_engine.step
+
+            def _timed_ds_step(*args, **kwargs):
+                t = _st_mark()
+                out = _ds_step(*args, **kwargs)
+                _st_phases["ds_engine_step"] = (_st_mark() - t) * 1e3
+                return out
+            _ds_engine.step = _timed_ds_step
+
         while self.global_step < self.max_steps:
+            if _st:
+                _st_t0 = _st_mark()
+                if _st_prev is not None:
+                    t0, td, tf, tb = _st_prev
+                    print(f"[STEPTIMING] rank={self.accelerator.process_index} micro={_st_n} "
+                          f"step={self.global_step} wait_ms={(td - t0) * 1e3:.0f} "
+                          f"fwd_ms={(tf - td) * 1e3:.0f} bwd_ms={(tb - tf) * 1e3:.0f} "
+                          f"post_ms={(_st_t0 - tb) * 1e3:.0f} total_ms={(_st_t0 - t0) * 1e3:.0f}", flush=True)
+                    _st_phases.pop("_last", None)
+                    if _st_phases:
+                        print(f"[STEPTIMING] rank={self.accelerator.process_index} update={self.global_step} phases "
+                              + " ".join(f"{k}_ms={v:.0f}" for k, v in _st_phases.items()), flush=True)
+                        _st_phases.clear()
+                    if _st_prof is not None and _st_prof_tag == "update_profile":
+                        _st_prof_finish()
+                        _st_prof = _st_sync = None
+                    _st_prev = None
+                    if _st_max and _st_n >= _st_max:
+                        self.accelerator.wait_for_everyone()
+                        print(f"[STEPTIMING] rank={self.accelerator.process_index} done", flush=True)
+                        os._exit(0)
+                _st_update_micro = _st_prof_update * self.gradient_accumulation_steps
+                if ((_st_prof_micro and _st_n + 1 == _st_prof_micro)
+                        or (_st_prof_update and _st_n + 1 == _st_update_micro)) and self.accelerator.is_main_process:
+                    _st_prof_tag = ("step_profile" if _st_prof_micro and _st_n + 1 == _st_prof_micro
+                                    else "update_profile")
+                    if _st_sync_debug:
+                        from .utils.step_profile import SyncSites
+                        _st_sync = SyncSites().__enter__()
+                    _st_prof = torch.profiler.profile(activities=[
+                        torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+                    _st_prof.__enter__()
             try:
                 _dl_t_fetch = time.perf_counter() if _dl_timing else None
                 sample = next(data_iter)
+                if _st:
+                    _st_td = _st_mark()
                 if _dl_t_fetch is not None:
                     _dl_wait_ms = int((time.perf_counter() - _dl_t_fetch) * 1000)
                     if (_dl_wait_ms > _dl_threshold_ms
@@ -1554,34 +1863,79 @@ class Wan22Trainer:
                 self.batch_in_epoch = 0
                 if self.train_sampler is not None:
                     self.train_sampler.clear_resume_batch_offset()
+                if getattr(self, "flowmap_ema", None) is not None:
+                    self.flowmap_ema.wait()      # no background thread while workers fork
                 data_iter = iter(self.train_loader)
                 continue
 
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
+                flow = getattr(train_model, "flow_map", None)
+                if flow is not None and flow.enabled and flow.self_distillation:
+                    from .models.helpers.flowmap_self import update_diagonal_mask
+                    if sample['action'].shape[0] != self.batch_size:
+                        raise ValueError("Exact self-distillation mixture requires full microbatches")
+                    sample['_flowmap_diagonal_mask'] = update_diagonal_mask(
+                        self.batch_size, self.gradient_accumulation_steps,
+                        self.accelerator.num_processes, self.accelerator.process_index,
+                        self._flowmap_microstep, self.global_step, self.seed,
+                        flow.self_diagonal_fraction)
+                    self._flowmap_microstep += 1
                 with self.accelerator.autocast():
                     loss, loss_dict = train_model.training_loss(sample)
+                if _st:
+                    _st_tf = _st_mark()
+                # FlexPi datasets may contain per_cam tensors without a composed
+                # video field. Actions carry the same batch dimension.
+                batch_tensor = sample['action'] if 'action' in sample else sample['video']
+                update_metrics.add(loss, loss_dict, int(batch_tensor.shape[0]))
                 self.accelerator.backward(loss)
+                if _st:
+                    _st_prev = (_st_t0, _st_td, _st_tf, _st_mark())
+                    _st_n += 1
+                    if _st_prof is not None and _st_prof_tag == "step_profile":
+                        _st_prof_finish()
+                        _st_prof = _st_sync = None
 
                 if self.accelerator.sync_gradients:
+                    _st_phase("_last")
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    _st_phase("clip")
                     self.optimizer.step()
+                    _st_phase("optimizer_step")
                     if not self.accelerator.optimizer_step_was_skipped:
                         self.scheduler.step()
+                        _st_phase("scheduler")
+                        if getattr(self, "flowmap_ema", None) is not None:
+                            self.flowmap_ema.update(self.accelerator.unwrap_model(self.model))
+                            _st_phase("ema")
+                            if _st and self.flowmap_ema.fold_seconds is not None:
+                                # The previous update's background fold (this one is still running).
+                                _st_phases["ema_prev_fold"] = self.flowmap_ema.fold_seconds * 1e3
+                    self._flowmap_microstep = 0
                     self.optimizer.zero_grad(set_to_none=True)
+                    _st_phase("zero_grad")
                     self.global_step += 1
-                    global_loss = float(
-                        self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
-                    )
-                    global_loss_metrics = {}
-                    for key, value in loss_dict.items():
-                        metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
-                        global_loss_metrics[key] = float(
-                            self.accelerator.gather(metric_tensor).mean().item()
-                        )
-                    grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
+                    update_stats = update_metrics.finish(self.accelerator)
+                    _st_phase("metrics_gather")
+                    global_loss = update_stats['metrics']['loss']['mean']
+                    global_loss_metrics = {key: values['mean'] for key, values in update_stats['metrics'].items()
+                                           if key != 'loss'}
+                    grad_norm_tensor = torch.as_tensor(grad_norm, device=loss.device, dtype=torch.float32).detach()
                     global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
+                    _st_phase("grad_norm_gather")
+                    if getattr(self, "fail_on_nonfinite", False) and not (
+                            np.isfinite(global_grad_norm) and np.isfinite(global_loss)
+                            and all(np.isfinite(v) for v in global_loss_metrics.values())):
+                        raise FloatingPointError("Nonfinite update metrics; refusing to continue this segment")
+                    if loss.device.type == 'cuda' and self.log_every > 0 and self.global_step % self.log_every == 0:
+                        peaks = loss.new_tensor([torch.cuda.max_memory_allocated(loss.device),
+                                                torch.cuda.max_memory_reserved(loss.device)], dtype=torch.float32)
+                        peaks = self.accelerator.gather(peaks[None]).amax(dim=0).cpu().tolist()
+                        update_stats['peak_allocated_gib'] = peaks[0] / 2**30
+                        update_stats['peak_reserved_gib'] = peaks[1] / 2**30
+                    _st_phase("memory_gather")
 
                     current_lr = float(self.optimizer.param_groups[0]["lr"])
 
@@ -1609,6 +1963,10 @@ class Wan22Trainer:
                             self.max_steps,
                             global_loss,
                         )
+                        description += 'microbatch_loss_range=[%.4f,%.4f] update_examples=%d grad_norm=%.4f ' % (
+                            update_stats['metrics']['loss']['microbatch_min'],
+                            update_stats['metrics']['loss']['microbatch_max'],
+                            update_stats['examples'], global_grad_norm)
                         if global_loss_metrics:
                             detail_str = " ".join([
                                 f"{k}={v:.4f}"
@@ -1646,34 +2004,34 @@ class Wan22Trainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
+                        for key, values in update_stats['metrics'].items():
+                            wandb_payload[f'train/{key}_microbatch_min'] = values['microbatch_min']
+                            wandb_payload[f'train/{key}_microbatch_max'] = values['microbatch_max']
+                        wandb_payload['train/update_examples'] = update_stats['examples']
+                        for key in ('peak_allocated_gib', 'peak_reserved_gib'):
+                            if key in update_stats:
+                                wandb_payload['performance/' + key] = update_stats[key]
+                        # Preserve stream ranges even when W&B is disabled.
+                        with open(Path(self.output_dir) / 'train_update_metrics.jsonl', 'a') as handle:
+                            handle.write(json.dumps(dict(step=self.global_step, epoch=self.epoch,
+                                grad_norm=global_grad_norm, learning_rate=current_lr, **update_stats)) + '\n')
                         self._wandb_log(wandb_payload)
+                    _st_phase("logging")
 
-                    if (
-                        self.eval_every > 0
-                        and self.val_dataset is not None
-                        and self.global_step % self.eval_every == 0
-                    ):
+                    complete = self.global_step >= self.max_steps
+                    pause = self._pause_due()
+                    _st_phase("pause_check")
+                    if complete or pause or (self.save_every > 0 and self.global_step % self.save_every == 0):
+                        ckpt_info = self.save_checkpoint()
+                        if self.accelerator.is_main_process:
+                            logger.info("[ckpt] step=%d weights=%s state=%s", self.global_step,
+                                        ckpt_info['weights_path'], ckpt_info['state_path'])
+                    scheduled_eval = self.eval_every > 0 and self.global_step % self.eval_every == 0
+                    final_eval = (complete or pause) and getattr(self, "eval_on_pause", False)
+                    if (scheduled_eval or final_eval) and self.val_dataset is not None:
                         self._run_eval_and_log()
-
-                    if self.save_every > 0 and self.global_step % self.save_every == 0:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
-                            logger.info(
-                                "[ckpt] step=%d weights=%s state=%s",
-                                self.global_step,
-                                ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
-                            )
-
-                    if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
-                        if self.accelerator.is_main_process:
-                            logger.info(
-                                "[done] max_steps reached step=%d weights=%s state=%s",
-                                self.global_step,
-                                ckpt_info["weights_path"],
-                                ckpt_info["state_path"],
-                            )
+                    if complete or pause:
+                        self._finish_segment(ckpt_info, complete)
                         return
 
         ckpt_info = self.save_checkpoint()

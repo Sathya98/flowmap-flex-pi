@@ -14,11 +14,22 @@ replacing/augmenting the per-modality **flow-matching heads** (which learn an OD
 (few-step / consistency-style maps that jump between noise levels directly). The stream
 plumbing, MoT backbone, dataloaders, and training harness stay; the *heads and the
 denoise/step loop* are the surface we change. See
-[`.claude/context/05-flowmap-conversion.md`](.claude/context/05-flowmap-conversion.md)
-for the working plan and the exact insertion points.
+[docs/FLOW_MAPS.md](docs/FLOW_MAPS.md) for the implementation, objectives,
+experiment matrix, and validation limits. Earlier context documents are design history.
 
-> Current status: understanding-the-repo phase. No conversion code written yet. Work
-> happens on a `dev` branch off `main`.
+> Current status: opt-in multi-stream flow-map training and inference on `dev-pedro`,
+> with distillation/self-distillation and full/LoRA/adapter/head tuning. CPU regression
+> coverage uses tiny real models; full-scale GPU and robotics validation is pending.
+
+The main study is now **full joint + full parameter tuning**: released FM baseline,
+task-checkpoint distillation, and AGIBOT-initialized self-distillation across objectives
+and NFEs. Train on LIBERO and RoboTwin; evaluate LIBERO models unchanged on LIBERO-Plus.
+See [FULL_JOINT_STUDY.md](docs/FULL_JOINT_STUDY.md). Stream subsets and LoRA/adapters/heads
+are future ablations. The general AGIBOT checkpoint must be acquired separately.
+
+Porting the flow-map stack (LSD/LMD, latent cache, batching, EMA, kernels) to the
+Wan2.2-TI2V-5B **world model** in `../exmachina/diffsynth-studio`: see
+[docs/wm_wan_extension.md](docs/wm_wan_extension.md) (plan; nothing ported yet).
 
 ## 📚 Context docs (read these on demand)
 
@@ -34,6 +45,7 @@ before relying on it (the tree moves).
 | [`03-dataloaders.md`](.claude/context/03-dataloaders.md) | The LeRobot data pipeline: `RobotVideoDataset` → `FlexPiProcessor`, the sample dict, the 33→9→3 temporal cascade, depth codecs, the composite-layout/slot system, action/rotation transforms, camera intrinsics, the T5 text cache. |
 | [`04-repo-map.md`](.claude/context/04-repo-map.md) | File-by-file map, eval/deploy entry points, dependencies, and the external services this involves (HuggingFace downloads, SLURM, Wan2.2/DINOv3/DA3 weights). |
 | [`05-flowmap-conversion.md`](.claude/context/05-flowmap-conversion.md) | The conversion working notes: what "flow map" means here, the surgical insertion points across the heads and the step loop, open questions. |
+| [`07-efficiency-notes.md`](.claude/context/07-efficiency-notes.md) | Training cost of the flow-map objectives: measured s/update and memory (PFMM, LMD), why LMD's forward AD costs memory, LSD/ESD vs LMD JVP/gradient structure, estimated timings, the self-distillation mask imbalance, the forward-AD attention path, the 1-GPU profiling benchmark (`scripts/profile_flowmap_step.py`) and its results, the trainer-timing harness (`FLEXPI_STEP_TIMING`) and the DeepSpeed ZeRO-2 hook bug it found (patched in `utils/deepspeed_compat.py`), the TVM fused attention-JVP validation and integration (`jvp_kernel_analysis/`), the microstep profile and CUDA-graph/compile plan and the background EMA fix (§11), the per-update timeline from baseline to now (§12), and the TODO list. |
 
 ## 🗺️ Architecture at a glance
 

@@ -1,0 +1,54 @@
+# Infrastructure pilot, not a benchmark training budget.
+defaults:
+  - train
+  - override task: libero_unified_flex_2cam224_32d_rotvec_1e-4
+  - _self_
+
+output_dir: ./runs/flowmap_pilots/libero_pfmm_${oc.env:SLURM_JOB_ID,manual}
+pretrained_ckpt: ./checkpoints/released/flexpi-libero/checkpoints/weights/step_010860.pt
+pretrained_ckpt_strict_shape: true
+resume: null
+batch_size: 1
+gradient_accumulation_steps: 1
+num_workers: 2
+learning_rate: 1.0e-5
+max_steps: 50
+log_every: 1
+save_every: 0                 # trainer still saves weights + full state at completion
+eval_every: 0
+eval_video: false
+keep_last_n_states: 1
+keep_last_n_weights: 1
+mixed_precision: bf16
+seed: 42
+wandb:
+  enabled: false
+
+data:
+  train:
+    val_set_proportion: 0.0
+    pretrained_norm_stats: ./checkpoints/released/flexpi-libero/dataset_stats.json
+
+model:
+  mot_checkpoint_mixed_attn: true
+  enable_pointmap: true
+  joint_video: true
+  joint_dino: true
+  joint_pointmap: true
+  flex_joint:
+    enabled: false
+  flow_map:
+    enabled: true
+    objective: pfmm
+    pfmm_loss_space: velocity
+    lmd_teacher_gradient: detached
+    distill_learned_time_weighting: false
+    distill_ema: false
+    mode: full
+    initialization: pretrained
+    streams: [action, video, dino, pointmap]
+    teacher_checkpoint: ${pretrained_ckpt}
+    teacher_steps: 4
+    strip_width: 1.0
+    schedule_shift: 1.0
+    num_inference_steps: 2

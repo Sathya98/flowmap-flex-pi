@@ -16,7 +16,7 @@ dependencies = [
   # libx264rgb depth pair and AV1 video through it, and it is the default
   # path (LEROBOT_DEPTH_DECORD=0 falls back to the slower pyav branch).
   "decord2==3.3.0",
-  "deepspeed==0.18.5",
+  "deepspeed==0.18.9",
   "einops==0.8.1",
   "gitpython==3.1.45",
   "huggingface-hub==0.29.2",

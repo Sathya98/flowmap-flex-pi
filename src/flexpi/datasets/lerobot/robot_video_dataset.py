@@ -949,17 +949,27 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if self.text_embedding_cache_dir is None:
             raise ValueError("text_embedding_cache_dir is not set.")
         cache_dir = self.text_embedding_cache_dir
-        os.makedirs(cache_dir, exist_ok=True)
         hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
-        if not os.path.exists(cache_path):
-            raise FileNotFoundError(
-                f"Missing text embedding cache: {cache_path}. "
-                "Run scripts/precompute_text_embeds.py first."
-            )
-        payload = torch.load(cache_path, map_location="cpu")
-        context = payload["context"]
-        context_mask = payload["mask"].bool()
+        # Sharded release (RoboTwin 3D: ~1M prompts) is read in place.
+        shards = self.__dict__.get("_text_shards")
+        if shards is None:
+            from flexpi.datasets.text_embed_shards import ShardedTextEmbeds
+            shards = self._text_shards = (ShardedTextEmbeds(cache_dir)
+                                          if ShardedTextEmbeds.present(cache_dir) else False)
+        if shards:
+            cache_path = f"{cache_dir} (sharded, key {hashed})"
+            context, context_mask = shards.get(hashed)
+        else:
+            os.makedirs(cache_dir, exist_ok=True)
+            cache_path = os.path.join(cache_dir, f"{hashed}.t5_len{self.context_len}.wan22ti2v5b.pt")
+            if not os.path.exists(cache_path):
+                raise FileNotFoundError(
+                    f"Missing text embedding cache: {cache_path}. "
+                    "Run scripts/precompute_text_embeds.py first."
+                )
+            payload = torch.load(cache_path, map_location="cpu")
+            context = payload["context"]
+            context_mask = payload["mask"].bool()
         if context.ndim != 2:
             raise ValueError(
                 f"Cached `context` must be 2D [L, D], got shape {tuple(context.shape)} in {cache_path}"

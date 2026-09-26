@@ -1,0 +1,12 @@
+# Short, full-joint external-distillation pilot; extend only after evaluation.
+defaults:
+  - flowmap_libero_lmd_full
+  - _self_
+output_dir: ${oc.env:FLOWMAP_RUN_DIR,./runs/flowmap_fulljoint/libero_lmd_100_manual}
+# The trainer uses 5% warmup: five updates on this 100-update schedule.
+max_steps: 100
+save_every: 25
+eval_every: 25
+keep_weight_steps: [25, 50, 75, 100]
+wandb:
+  name: libero-lmd-fullgrad-fulljoint-100-s42

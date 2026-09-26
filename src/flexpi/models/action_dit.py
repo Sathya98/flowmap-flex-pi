@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 from flexpi.utils.logging_config import get_logger
 
 from .helpers.gradient import gradient_checkpoint_forward
+from .helpers.normalization import ForwardADLayerNorm
 from .wan_video_dit import (
     DiTBlock,
     sinusoidal_embedding_1d,
@@ -18,7 +19,7 @@ logger = get_logger(__name__)
 class ActionHead(nn.Module):
     def __init__(self, hidden_dim: int, out_dim: int, eps: float):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
+        self.norm = ForwardADLayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
         self.proj = nn.Linear(hidden_dim, out_dim)
         self.modulation = nn.Parameter(torch.randn(1, 2, hidden_dim) / hidden_dim**0.5)
 
@@ -30,7 +31,10 @@ class ActionHead(nn.Module):
 
 
 class ActionDiT(nn.Module):
-    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
+    # `time_embedding_delta.` is the flow-map second-time path: it does not
+    # exist in the Wan-derived backbone payload and must be KEPT at its
+    # zero-init rather than demanded by the strict merge in `from_pretrained`.
+    ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.", "time_embedding_delta.")
     ACTION_BACKBONE_META_KEYS = (
         "hidden_dim",
         "ffn_dim",
@@ -54,6 +58,7 @@ class ActionDiT(nn.Module):
         attn_head_dim: int,
         num_layers: int,
         use_gradient_checkpointing: bool = False,
+        use_time_delta: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -83,6 +88,23 @@ class ActionDiT(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        # Flow-map second time input. Positional embedding of the jump
+        # Δ = t_target − t_input, ADDED to the `t` conditioning before
+        # `time_projection` (Boffi et al. 2025: embed s and (t−s), sum, FiLM).
+        # The final Linear is zero-init so an enabled-but-untrained map is
+        # byte-identical to the single-time flow-matching model; `None` when
+        # disabled so `embed_time` reduces exactly to the original path.
+        self.use_time_delta = bool(use_time_delta)
+        if self.use_time_delta:
+            self.time_embedding_delta = nn.Sequential(
+                nn.Linear(freq_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            nn.init.zeros_(self.time_embedding_delta[2].weight)
+            nn.init.zeros_(self.time_embedding_delta[2].bias)
+        else:
+            self.time_embedding_delta = None
         self.blocks = nn.ModuleList(
             [
                 DiTBlock(
@@ -225,12 +247,48 @@ class ActionDiT(nn.Module):
         )
         return action_expert.to(device=device, dtype=torch_dtype)
 
+    def embed_time(
+        self,
+        timestep: torch.Tensor,
+        timestep_delta: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Time conditioning `t` [N, hidden] that feeds `time_projection` (AdaLN).
+
+        `timestep` is the noise level of the *input* (the flow-map start level
+        s). When the Δ path is enabled, `timestep_delta = t_target − t_input`
+        (same timestep units, signed) is embedded positionally and ADDED; a
+        missing Δ means Δ=0, i.e. the diagonal / instantaneous velocity. With
+        the path disabled this is exactly the original single-time path.
+        """
+        emb_dtype = self.time_embedding[0].weight.dtype
+        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(emb_dtype))
+        if self.time_embedding_delta is None:
+            return t
+        if timestep_delta is None:
+            timestep_delta = torch.zeros_like(timestep)
+        elif timestep_delta.shape != timestep.shape:
+            if timestep_delta.numel() == 1:
+                timestep_delta = timestep_delta.reshape(1).expand_as(timestep)
+            else:
+                raise ValueError(
+                    f"`timestep_delta` shape {tuple(timestep_delta.shape)} must match "
+                    f"`timestep` shape {tuple(timestep.shape)}"
+                )
+        delta_emb = sinusoidal_embedding_1d(self.freq_dim, timestep_delta).to(emb_dtype)
+        # Center the additional conditioning on the diagonal. This preserves
+        # the current single-time path, not frozen teacher weights after tuning.
+        zero_emb = sinusoidal_embedding_1d(
+            self.freq_dim, torch.zeros((1,), dtype=timestep.dtype, device=timestep.device),
+        )
+        return t + (self.time_embedding_delta(delta_emb) - self.time_embedding_delta(zero_emb.to(emb_dtype)))
+
     def pre_dit(
         self,
         action_tokens: torch.Tensor,
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        timestep_delta: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if action_tokens.ndim != 3:
             raise ValueError(
@@ -279,7 +337,7 @@ class ActionDiT(nn.Module):
                 f"Action token length {seq_len} exceeds RoPE cache {self.freqs.shape[0]}."
             )
 
-        t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep))
+        t = self.embed_time(timestep, timestep_delta)
 
         t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))
 
@@ -310,12 +368,14 @@ class ActionDiT(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor,
         context_mask: Optional[torch.Tensor] = None,
+        timestep_delta: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pre_state = self.pre_dit(
             action_tokens=action_tokens,
             timestep=timestep,
             context=context,
             context_mask=context_mask,
+            timestep_delta=timestep_delta,
         )
         x = pre_state["tokens"]
         context = pre_state["context"]

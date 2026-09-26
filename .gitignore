@@ -277,3 +277,10 @@ eval_out/
 
 # Machine-specific eval wrapper (scripts/local_run.sh) — dev box only, never released.
 scripts/local_*.sh
+
+# SLURM job logs (scripts/slurm/*.sbatch write here; the folder must exist)
+slurm_logs/*
+!slurm_logs/.gitkeep
+
+# Third-party clones studied in jvp_kernel_analysis (sources listed in its notes)
+jvp_kernel_analysis/repos/

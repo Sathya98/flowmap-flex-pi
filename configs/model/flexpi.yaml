@@ -55,6 +55,39 @@ flex_joint:
   cross_modal_predict_video: true
   cross_modal_predict_dino: true
   cross_modal_predict_pointmap: true
+  # One regime per microbatch (shared attention mask). See FlexJointConfig.
+  share_within_microbatch: false
+
+# Flow-map experiments: all generated streams use the same two-time objective.
+# Non-generated visual streams retain their clean observation anchors.
+flow_map:
+  enabled: false
+  objective: lmd           # lmd | emd | pfmm | lsd | esd | psd_m | psd_u
+  streams: [action, video, dino, pointmap]  # main study: full joint
+  mode: full              # full | lora | adapter | heads
+  initialization: pretrained  # random resets denoisers; frozen encoders stay pretrained
+  teacher_checkpoint: null    # LMD/EMD/PFMM; falls back to pretrained_ckpt
+  rank: 16
+  lora_alpha: 16.0
+  self_diagonal_fraction: 0.75
+  learned_time_weighting: true  # self-distillation reference recipe
+  distill_learned_time_weighting: false  # external distillation weighting ablation
+  distill_ema: false             # new comparison configs enable it
+  lmd_teacher_gradient: detached # full for original teacher-input gradients
+  ema_decays: [0.999, 0.9999]   # evaluation checkpoints when EMA is enabled
+  pfmm_loss_space: velocity    # legacy pilots; new primary configs use endpoint
+  diagonal_weight: 1.0        # mandatory data-grounded term for self-distillation
+  distill_diagonal_weight: 0.0
+  map_weight: 1.0
+  teacher_steps: 4            # Euler steps for PFMM teacher targets
+  num_inference_steps: 2
+  schedule_shift: 1.0         # shared joint schedule, independent of legacy shifts
+  strip_width: 1.0            # supports all K >= 1; inference rejects larger jumps
+  time_sampling: uniform_triangle  # Boffi uniform-area proposal; conditional is an ablation
+  dt_method: auto             # exact JVP; FD requires float32
+  detach_derivatives: false   # true: lower-memory expanded semigradient variant
+  jvp_attention: explicit     # tvm: fused Triton attention JVP (helpers/jvp_attention)
+  fd_eps: 1.0e-4
 
 video_dit_config:
   has_image_input: false

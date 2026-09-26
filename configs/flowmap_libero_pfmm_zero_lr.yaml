@@ -1,0 +1,8 @@
+# A zero-LR optimizer step must preserve every loaded pretrained tensor.
+defaults:
+  - flowmap_libero_pfmm_accum_smoke
+  - _self_
+output_dir: ./runs/flowmap_pilots/libero_pfmm_zero_lr_${oc.env:SLURM_JOB_ID,manual}
+learning_rate: 0.0
+gradient_accumulation_steps: 1
+max_steps: 2
