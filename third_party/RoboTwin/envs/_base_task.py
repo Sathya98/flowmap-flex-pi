@@ -32,6 +32,10 @@ from typing import Optional, Literal
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
 
+EVAL_VIDEO_STRIDE = max(1, int(os.environ.get("EVAL_VIDEO_STRIDE", "4")))  # eval video: one frame every N actions
+RT_SPP = int(os.environ.get("ROBOTWIN_RT_SPP", "32"))  # ray-tracing samples per pixel (RoboTwin default 32)
+RENDER_SHADOW_SPP = int(os.environ.get("RENDER_SHADOW_SPP", "0") or 0)  # >0: shadow cameras at this spp (get_shadow_obs)
+
 
 class Base_Task(gym.Env):
 
@@ -98,6 +102,7 @@ class Base_Task(gym.Env):
         self.now_obs = {}
         self.take_action_cnt = 0
         self.eval_video_path = kwags.get("eval_video_save_dir", None)
+        self.eval_video_frames = []  # head-camera frames of this episode (eval video)
 
         self.save_freq = kwags.get("save_freq")
         self.world_pcd = None
@@ -212,7 +217,7 @@ class Base_Task(gym.Env):
         self.engine.set_renderer(self.renderer)
 
         sapien.render.set_camera_shader_dir("rt")
-        sapien.render.set_ray_tracing_samples_per_pixel(32)
+        sapien.render.set_ray_tracing_samples_per_pixel(RT_SPP)
         sapien.render.set_ray_tracing_path_depth(8)
         sapien.render.set_ray_tracing_denoiser("oidn")
 
@@ -411,6 +416,8 @@ class Base_Task(gym.Env):
             **kwags,
         )
         self.cameras.load_camera(self.scene)
+        if RENDER_SHADOW_SPP:
+            self.cameras.add_shadow_cameras(self.scene, RENDER_SHADOW_SPP, RT_SPP)
         self.scene.step()  # run a physical step
         self.scene.update_render()  # sync pose from SAPIEN to renderer
 
@@ -433,6 +440,16 @@ class Base_Task(gym.Env):
         self.scene.update_render()
 
     # =========================================================== Basic APIs ===========================================================
+
+    def get_shadow_obs(self):
+        """``get_obs`` of the current state through the shadow cameras (RENDER_SHADOW_SPP)."""
+        sapien.render.set_ray_tracing_samples_per_pixel(self.cameras.shadow_spp)
+        self.cameras.swap_shadow()
+        try:
+            return self.get_obs()
+        finally:
+            self.cameras.swap_shadow()
+            sapien.render.set_ray_tracing_samples_per_pixel(self.cameras.main_spp)
 
     def get_obs(self):
         self._update_render()
@@ -571,6 +588,28 @@ class Base_Task(gym.Env):
         self.need_plan = args.get("need_plan", True)
         self.left_joint_path = args.get("left_joint_path", [])
         self.right_joint_path = args.get("right_joint_path", [])
+
+    def _record_eval_frame(self, force=False):
+        """Append (action index, head-camera view) for the eval video, every EVAL_VIDEO_STRIDE-th
+        action (``force``: the final frame). Renders that one camera directly, so the video moves
+        even when the policy skips the full observation between replans; each render is a
+        ray-traced frame, which is why it is strided and skipped for episodes that cannot be kept
+        (``eval_video_record``, set per episode by script/eval_policy.py, which writes the videos)."""
+        if (self.eval_video_path is None or not getattr(self, "eval_video_record", True)
+                or getattr(self, "_eval_video_broken", False)):
+            return
+        if not force and self.take_action_cnt % EVAL_VIDEO_STRIDE:
+            return
+        try:   # a video problem must never fail an evaluation episode
+            cams = self.cameras
+            head = cams.static_camera_list[cams.static_camera_name.index("head_camera")]
+            head.take_picture()
+            rgb = head.get_picture("Color")[:, :, :3]
+            self.eval_video_frames.append((self.take_action_cnt, (rgb * 255).clip(0, 255).astype("uint8")))
+        except Exception as exc:
+            print(f"[eval video] frame capture disabled: {exc!r}")
+            self._eval_video_broken = True
+            self.eval_video_frames = []
 
     def _set_eval_video_ffmpeg(self, ffmpeg):
         self.eval_video_ffmpeg = ffmpeg
@@ -1480,9 +1519,7 @@ class Base_Task(gym.Env):
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
 
-        eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+        self._record_eval_frame()
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1657,8 +1694,7 @@ class Base_Task(gym.Env):
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                self._record_eval_frame(force=True)
                 return
 
         self._update_render()

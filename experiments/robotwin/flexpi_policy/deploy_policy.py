@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import sys
@@ -245,6 +246,7 @@ class WorldActionRobotWinPolicy:
         infer_present_video: Optional[bool] = None,
         infer_present_dino: Optional[bool] = None,
         infer_present_pointmap: Optional[bool] = None,
+        prompt_cache_dir: Optional[str] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         if offload_text_encoder:
@@ -254,19 +256,36 @@ class WorldActionRobotWinPolicy:
             model_cfg_copy.load_text_encoder = True
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
+        # Prompt embeddings are cached on disk (prompt_cache_dir), keyed by the text encoder and
+        # the prompt; the frozen umT5 is shared by every checkpoint, so a cached prompt never needs
+        # it. With offload_text_encoder the encoder is loaded to CPU only on the first cache miss.
+        text_encoder_id = (
+            model_cfg_copy.get("model_id", "Wan-AI/Wan2.2-TI2V-5B"),
+            model_cfg_copy.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
+            int(model_cfg_copy.get("tokenizer_max_len", 512)),
+        )
+        self._prompt_cache_key = "|".join(map(str, text_encoder_id))
+        self._prompt_cache_dir = Path(prompt_cache_dir) if prompt_cache_dir else None
+        self._text_encoder_loader = None
+        self._offload_text_encoder = bool(offload_text_encoder)
         if offload_text_encoder:
-            from flexpi.models.helpers.loader import load_text_encoder_to_device
-            te, tok = load_text_encoder_to_device(
-                device="cpu",
-                torch_dtype=getattr(torch, model_dtype) if isinstance(model_dtype, str) else model_dtype,
-                model_id=model_cfg_copy.get("model_id", "Wan-AI/Wan2.2-TI2V-5B"),
-                tokenizer_model_id=model_cfg_copy.get("tokenizer_model_id", "Wan-AI/Wan2.1-T2V-1.3B"),
-                tokenizer_max_len=int(model_cfg_copy.get("tokenizer_max_len", 512)),
-            )
-            self.model.text_encoder = te
-            self.model.tokenizer = tok
-            self.model.offload_text_encoder = True
-            print("[FlexPi] Text encoder loaded on CPU (never touches GPU). Saves ~10GB VRAM.")
+            def _load_text_encoder():
+                from flexpi.models.helpers.loader import load_text_encoder_to_device
+                te, tok = load_text_encoder_to_device(
+                    device="cpu",
+                    torch_dtype=getattr(torch, model_dtype) if isinstance(model_dtype, str) else model_dtype,
+                    model_id=text_encoder_id[0],
+                    tokenizer_model_id=text_encoder_id[1],
+                    tokenizer_max_len=text_encoder_id[2],
+                )
+                # eval(): umT5 has dropout, and this may run after self.model.eval() (lazy load)
+                self.model.text_encoder = te.eval()
+                self.model.tokenizer = tok
+                self.model.offload_text_encoder = True
+                print("[FlexPi] Text encoder loaded on CPU (never touches GPU). Saves ~10GB VRAM.")
+            self._text_encoder_loader = _load_text_encoder
+            if self._prompt_cache_dir is None:
+                self._ensure_text_encoder()
         self.model = self.model.to(device).eval()
 
         if hasattr(self.model, "prepare_for_inference"):
@@ -356,6 +375,15 @@ class WorldActionRobotWinPolicy:
         self._obs_intrinsics_logged = False
 
         self.pending_actions: deque[np.ndarray] = deque()
+        # Eval videos: script/eval_policy.py switches this on; each replan's predicted
+        # video latents are kept (bf16, CPU) and decoded only for kept episodes.
+        self.record_predictions = False
+        self._predictions = []
+        # Render-divergence logging (script/eval_policy.py, RENDER_LOG_DIR): the last replan's
+        # chunk, and with keep_last_pred its full output (stream latents included).
+        self.keep_last_pred = False
+        self._last_pred = None
+        self._last_chunk = None
         self.episode_count = 0
         self.step_count = 0
         self._cached_prompt: Optional[str] = None
@@ -378,6 +406,42 @@ class WorldActionRobotWinPolicy:
         if bool(torch_compile):
             self._warmup()
 
+    def _ensure_text_encoder(self) -> None:
+        if self._text_encoder_loader is not None:
+            self._text_encoder_loader()
+            self._text_encoder_loader = None
+
+    @torch.no_grad()
+    def _encode_prompt(self, prompt: str):
+        """``model.encode_prompt`` through the on-disk cache (bit-identical: the stored tensor is
+        the encoder's output; rows past the prompt, which the encoder zeroes, are not stored)."""
+        path = None
+        if self._prompt_cache_dir is not None:
+            key = hashlib.sha256(f"{self._prompt_cache_key}|{prompt}".encode()).hexdigest()
+            path = self._prompt_cache_dir / f"{key}.pt"
+            if path.exists():
+                try:
+                    entry = torch.load(path, map_location="cpu", weights_only=True)
+                    context = torch.zeros(entry["shape"], dtype=entry["rows"].dtype)
+                    context[:, : entry["rows"].shape[1]] = entry["rows"]
+                    # same devices as encode_prompt: mask stays on CPU when the encoder is offloaded
+                    mask_device = "cpu" if self._offload_text_encoder else self.model.device
+                    return context.to(self.model.device), entry["mask"].to(mask_device)
+                except Exception as exc:   # a corrupt entry is re-encoded and rewritten
+                    logger.warning("prompt cache entry %s unreadable (%r); re-encoding", path, exc)
+        self._ensure_text_encoder()
+        context, mask = self.model.encode_prompt(prompt)
+        if path is not None:
+            nonzero = context[0].abs().sum(-1).nonzero()
+            n = int(nonzero[-1]) + 1 if len(nonzero) else 0
+            entry = {"prompt": prompt, "shape": tuple(context.shape), "rows": context[:, :n].cpu().clone(),
+                     "mask": mask.cpu()}
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".tmp{os.getpid()}")
+            torch.save(entry, tmp)
+            os.replace(tmp, path)
+        return context, mask
+
     def _warmup(self) -> None:
         """Run one dummy infer_action to trigger torch.compile + CUDA-Graph capture.
 
@@ -397,7 +461,7 @@ class WorldActionRobotWinPolicy:
         # Encode a dummy prompt (cleared after warmup so first real prompt re-encodes).
         dummy_prompt = DEFAULT_PROMPT.format(task="warmup")
         with torch.no_grad():
-            dummy_context, dummy_context_mask = self.model.encode_prompt(dummy_prompt)
+            dummy_context, dummy_context_mask = self._encode_prompt(dummy_prompt)
 
         proprio_dim = getattr(self.model, "proprio_dim", None)
         dummy_proprio = (
@@ -613,7 +677,11 @@ class WorldActionRobotWinPolicy:
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
 
-    def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
+    def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str,
+                            seed: Optional[int] = None, probe: bool = False):
+        """The action chunk for one replan. ``probe``: a side-effect-free extra call (no timing,
+        no recorded prediction) that returns ``(chunk, pred)`` with the stream latents, used by
+        ``render_divergence``; ``seed`` overrides the policy's noise seed."""
         # When use_per_cam is on (deploying a model trained with
         # RobotVideoDataset), build per-cam first and derive the
         # composite from it via the shared compose helper. Train and
@@ -644,7 +712,7 @@ class WorldActionRobotWinPolicy:
         prompt = DEFAULT_PROMPT.format(task=instruction)
         if self._cached_prompt != prompt:
             print(f"[FlexPi] Encoding prompt (episode {self.episode_count}): {prompt!r}")
-            self._cached_context, self._cached_context_mask = self.model.encode_prompt(prompt)
+            self._cached_context, self._cached_context_mask = self._encode_prompt(prompt)
             self._cached_prompt = prompt
         infer_kwargs = {
             "prompt": None,
@@ -657,7 +725,7 @@ class WorldActionRobotWinPolicy:
             "text_cfg_scale": self.text_cfg_scale,
             "num_inference_steps": self.num_inference_steps,
             "sigma_shift": self.sigma_shift,
-            "seed": self.seed,
+            "seed": self.seed if seed is None else seed,
             "rand_device": self.rand_device,
             "tiled": self.tiled,
         }
@@ -665,8 +733,9 @@ class WorldActionRobotWinPolicy:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
         if "return_stream_latents" in infer_sig:
             # Deploy reads only out["action"]; skip the blocking D2H copies of
-            # the denoised video/dino/pointmap latents.
-            infer_kwargs["return_stream_latents"] = False
+            # the denoised video/dino/pointmap latents unless an eval video
+            # wants the predicted future beside the rollout.
+            infer_kwargs["return_stream_latents"] = bool(self.record_predictions or probe or self.keep_last_pred)
         # Forward per_cam only when the model declares the kwarg — keeps
         # the deploy compatible with older composite-only models that
         # don't have per_cam in their infer_action signature.
@@ -702,21 +771,113 @@ class WorldActionRobotWinPolicy:
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
+        if probe:
+            return self._denormalize_action(pred["action"])[0], pred
+        if self.keep_last_pred:
+            self._last_pred = pred
         if self.timing_enabled:
             if self.model.device.type == "cuda":
                 torch.cuda.synchronize()
             self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
             self._infer_calls += 1
 
+        if self.record_predictions and pred.get("video_latents") is not None:
+            self._predictions.append((self.step_count, pred["video_latents"].to(torch.bfloat16)))
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
         return action_chunk
 
     def _fill_action_queue(self, observation: Dict[str, Any], instruction: str) -> None:
         action_chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        self._last_chunk = action_chunk
         n_exec = min(self.replan_steps, action_chunk.shape[0])
         for i in range(n_exec):
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
+
+    @torch.no_grad()
+    def prediction_frames(self, num_steps, frame_hw):
+        """Per executed step, the model's decoded prediction of the head camera (or None).
+
+        Each replan at step k0 predicted a clip whose frame j shows step k0 + j * stride,
+        with stride = action_horizon / (frames - 1) (frame 0 is the current observation).
+        The head camera is the layout slot mapped to ``cam_high``, resized to ``frame_hw``.
+        """
+        if not self._predictions:
+            return None
+        import cv2
+        layout = getattr(self.model, "_layout", None)
+        keys = getattr(self.model, "_slot_key_map", {}) or {}
+        slot = None
+        if layout is not None:
+            slot = next((sl for sl in layout.slots if keys.get(sl.key) == "cam_high"), layout.slots[0])
+        h, w = frame_hw
+        out = [None] * num_steps
+        for r, (k0, latents) in enumerate(self._predictions):
+            k1 = self._predictions[r + 1][0] if r + 1 < len(self._predictions) else num_steps
+            clip = self.model._decode_latents(latents.to(device=self.model.device, dtype=self.model.torch_dtype))
+            clip = [np.asarray(f) for f in clip]
+            if slot is not None:
+                clip = [f[slot.top:slot.top + slot.h, slot.left:slot.left + slot.w] for f in clip]
+            clip = [cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA) for f in clip]
+            stride = self.action_horizon / max(len(clip) - 1, 1)
+            for k in range(k0, min(k1, num_steps)):
+                out[k] = clip[min(int(round((k - k0) / stride)), len(clip) - 1)]
+        return out
+
+    @torch.no_grad()
+    def render_divergence(self, observation, shadow_observation, instruction, decode=True):
+        """How far the policy's outputs move when the state of the replan just taken is rendered
+        differently (``shadow_observation``: same state, other ray-tracing spp), next to the
+        reference spread from changing only the policy's noise seed (seed + 1) on the original
+        render. Compares the camera pixels, the action chunk, the predicted stream latents and
+        (``decode``) the decoded predicted video. Call right after the replan's ``step``."""
+        def psnr(a, b):
+            mse = float(np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2))
+            return float("inf") if mse == 0 else 10 * np.log10(255.0 ** 2 / mse)
+        out = {}
+        for cam in _CAM_ORDER:
+            key = _CAM_NAME_TO_OBS[cam]
+            a, b = observation["observation"][key], shadow_observation["observation"][key]
+            d = np.abs(a["rgb"].astype(np.int16) - b["rgb"].astype(np.int16))
+            out[f"px_{key}"] = {"mae": float(d.mean()), "psnr": psnr(a["rgb"], b["rgb"]),
+                                "p99": float(np.percentile(d, 99)), "max": int(d.max())}
+            dd = np.abs(np.asarray(a["depth"], np.float64) - np.asarray(b["depth"], np.float64))
+            out[f"depth_{key}"] = {"mae_mm": float(dd.mean()), "frac_changed": float((dd > 0).mean()),
+                                   "max_mm": float(dd.max())}
+        main = self._last_pred
+        chunks = {"main": self._last_chunk}
+        preds = {"main": main}
+        chunks["render"], preds["render"] = self._infer_action_chunk(shadow_observation, instruction, probe=True)
+        chunks["noise"], preds["noise"] = self._infer_action_chunk(observation, instruction, probe=True,
+                                                                   seed=(self.seed or 0) + 1)
+        n_exec = min(self.replan_steps, chunks["main"].shape[0])
+        for alt in ("render", "noise"):
+            r = {}
+            an, bn = preds["main"]["action"].float(), preds[alt]["action"].float()
+            r["act_norm_rmse"] = float((an - bn).pow(2).mean().sqrt())
+            r["act_norm_rmse_exec"] = float((an[:n_exec] - bn[:n_exec]).pow(2).mean().sqrt())
+            r["act_norm_maxabs"] = float((an - bn).abs().max())
+            dq = np.abs(chunks["main"] - chunks[alt])
+            r["act_qpos_maxabs"] = float(dq.max())
+            r["act_qpos_maxabs_exec"] = float(dq[:n_exec].max())
+            r["act_first_maxabs"] = float(dq[0].max())
+            for name in ("video", "dino", "pointmap"):
+                la, lb = preds["main"].get(f"{name}_latents"), preds[alt].get(f"{name}_latents")
+                if la is not None and lb is not None:
+                    r[f"{name}_lat_relerr"] = float((la - lb).norm() / la.norm().clamp_min(1e-12))
+            out[alt] = r
+        if decode and preds["main"].get("video_latents") is not None:
+            dev, dt = self.model.device, self.model.torch_dtype
+            clips = {k: [np.asarray(f) for f in self.model._decode_latents(
+                         preds[k]["video_latents"].to(device=dev, dtype=dt))] for k in preds}
+            for alt in ("render", "noise"):
+                p = [psnr(x, y) for x, y in zip(clips["main"], clips[alt])]
+                out[alt]["pred_video_psnr_frame0"] = p[0]
+                out[alt]["pred_video_psnr_future"] = float(np.mean(p[1:])) if len(p) > 1 else None
+                out[alt]["pred_video_mae_future"] = float(np.mean(
+                    [np.abs(x.astype(np.int16) - y.astype(np.int16)).mean()
+                     for x, y in zip(clips["main"][1:], clips[alt][1:])])) if len(p) > 1 else None
+        return out
 
     def should_request_observation(self) -> bool:
         return not self.pending_actions
@@ -772,6 +933,7 @@ class WorldActionRobotWinPolicy:
                 flush=True,
             )
         self.pending_actions.clear()
+        self._predictions = []
         self.episode_count += 1
         self.step_count = 0
         self._cached_prompt = None
@@ -1051,6 +1213,7 @@ def get_model(usr_args: Dict[str, Any]):
         infer_present_video=infer_present_video,
         infer_present_dino=infer_present_dino,
         infer_present_pointmap=infer_present_pointmap,
+        prompt_cache_dir=usr_args.get("prompt_cache_dir"),
     )
     return policy
 

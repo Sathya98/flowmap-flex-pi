@@ -270,6 +270,32 @@ class Camera:
         world_cam_mat44[:3, 3] = world_cam_pos
         self.world_camera2.entity.set_pose(sapien.Pose(world_cam_mat44))
 
+    def add_shadow_cameras(self, scene, spp, restore_spp):
+        """A copy of the observation cameras (static + wrist) rendering at ray-tracing ``spp``, for
+        rendering diagnostics. SAPIEN fixes a camera's spp when it is set up (switching the global
+        setting later does not change it), so the copies are made, and first rendered by
+        ``Base_Task.get_shadow_obs``, under ``spp``. They take the originals' intrinsics and poses
+        and draw no random numbers. ``swap_shadow`` exchanges them with the originals."""
+        from sapien import render as sapien_render
+        sapien_render.set_ray_tracing_samples_per_pixel(spp)
+        def copy(c):
+            s = scene.add_camera(name=f"shadow_{getattr(c, 'name', 'camera')}", width=c.width, height=c.height,
+                                 fovy=c.fovy, near=c.near, far=c.far)
+            s.entity.set_pose(c.entity.get_pose())
+            return s
+        self._shadow = {"static_camera_list": [copy(c) for c in self.static_camera_list]}
+        if self.collect_wrist_camera:
+            self._shadow["left_camera"] = copy(self.left_camera)
+            self._shadow["right_camera"] = copy(self.right_camera)
+        self.shadow_spp, self.main_spp = spp, restore_spp
+        sapien_render.set_ray_tracing_samples_per_pixel(restore_spp)
+
+    def swap_shadow(self):
+        for k in self._shadow:
+            current = getattr(self, k)
+            setattr(self, k, self._shadow[k])
+            self._shadow[k] = current
+
     def update_picture(self):
         # camera
         if self.collect_wrist_camera:

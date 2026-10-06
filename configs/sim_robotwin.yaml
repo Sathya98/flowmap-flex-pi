@@ -53,6 +53,11 @@ EVALUATION:
   dataset_stats_path: null
   device: cuda
 
+  # Caches shared by every evaluated model (relative to the repo; null disables).
+  expert_cache_dir: evaluate_results/robotwin/.expert_cache  # expert-check outcome + episode info per seed
+  prompt_cache_dir: evaluate_results/robotwin/.prompt_cache  # umT5 prompt embeddings
+  worker_units_file: null  # set by run_robotwin_manager.py (persistent workers); not for direct use
+
 MULTIRUN:
   enabled: false
   num_gpus: 8
@@ -60,6 +65,7 @@ MULTIRUN:
   phases: [clean, random]   # subset of {clean, random}; order = launch order per task
   tasks: null               # null = all tasks from _eval_step_limit.yml; or explicit list e.g. [adjust_bottle, beat_block_hammer]
   shard: null               # null = no sharding; "N/K" = block shard (this-machine N of K, 0-indexed): tasks[N*chunk:(N+1)*chunk], chunk=ceil(total/K)
+  persistent_workers: true  # one process (one model load) per worker slot, claiming tasks in turn; false = one process per task
 
 hydra:
   job:

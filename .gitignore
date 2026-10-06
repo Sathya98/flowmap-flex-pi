@@ -284,3 +284,6 @@ slurm_logs/*
 
 # Third-party clones studied in jvp_kernel_analysis (sources listed in its notes)
 jvp_kernel_analysis/repos/
+
+# RoboTwin cuRobo build (script/_install.sh clones it here)
+third_party/RoboTwin/envs/curobo/

@@ -1,6 +1,7 @@
 import csv
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -55,6 +56,7 @@ def _is_blocked_override(raw_override: str) -> bool:
         "EVALUATION.task_name",
         "EVALUATION.task_config",
         "EVALUATION.output_dir",
+        "EVALUATION.worker_units_file",
     }:
         return True
     return key.startswith("MULTIRUN.") or key.startswith("hydra.")
@@ -374,12 +376,79 @@ def main(cfg: DictConfig):
     )
     log(f"resume scan: loaded {resumed} existing (task, phase) results; {len(pending_tasks)} of {len(tasks)} tasks pending")
 
-    # Launch initial tasks for each GPU up to capacity.
-    for gpu_id in gpu_ids:
-        try_launch_pending(gpu_id)
-
     has_failure = False
     failure_message = ""
+
+    if bool(cfg.MULTIRUN.get("persistent_workers", False)) and len(pending_tasks) > 0:
+        # Persistent workers: max_tasks_per_gpu processes per GPU, each loading the model once
+        # and claiming the next unfinished (task, phase) unit from a shared list until none is
+        # left (eval_policy.py: mkdir in .claims is the atomic claim). Results are harvested
+        # from the result files as they appear; a failed worker stops all (rerun resumes).
+        units = [(t, p) for t in pending_tasks for p in phases if task_rates[t][p] is None]
+        claim_dir = run_output_dir / ".claims"
+        shutil.rmtree(claim_dir, ignore_errors=True)   # claims of a previous (dead) manager run
+        claim_dir.mkdir()
+        units_file = run_output_dir / ".worker_units.json"
+        units_file.write_text(json.dumps({"claim_dir": str(claim_dir), "units": [
+            {"task_name": t, "task_config": phase_to_task_config[p], "eval_output_dir": str(run_output_dir / t),
+             "result_file": str(run_output_dir / t / _phase_result_filename(p))} for t, p in units]}, indent=1))
+        remaining = set(units)
+
+        def harvest(final: bool) -> None:
+            for t, p in sorted(remaining):
+                result_file = run_output_dir / t / _phase_result_filename(p)
+                if not result_file.exists():
+                    continue
+                try:
+                    task_rates[t][p] = _parse_success_rate(result_file)
+                except Exception as exc:
+                    if final:
+                        log(f"result parse failed: task={t}, phase={p}, error={repr(exc)}")
+                    continue   # possibly still being written; next poll
+                remaining.discard((t, p))
+                log(f"done task={t} phase={p} success_rate={task_rates[t][p]:.4f}")
+
+        n_workers = min(num_gpus * max_tasks_per_gpu, len(units))
+        for k in range(n_workers):
+            gpu_id = gpu_ids[k % num_gpus]
+            cmd = [sys.executable, str(SINGLE_ENTRY), f"ckpt={str(ckpt_path)}", f"gpu_id={gpu_id}",
+                   f"EVALUATION.worker_units_file={str(units_file)}", f"EVALUATION.output_dir={str(output_dir)}",
+                   *extra_overrides]
+            log(f"launch worker={k} gpu={gpu_id} units={len(units)} cmd={' '.join(cmd)}")
+            running_states.append(RunningState(task_name=f"worker{k}", gpu_id=gpu_id, phase="*",
+                                               process=subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), text=True)))
+        while len(running_states) > 0:
+            harvest(final=False)
+            for state in list(running_states):
+                return_code = state.process.poll()
+                if return_code is None:
+                    continue
+                running_states.remove(state)
+                if return_code != 0:
+                    has_failure = True
+                    failure_message = f"worker failed: {state.task_name}, gpu={state.gpu_id}, return_code={return_code}"
+                    failed_records.append({"task_name": state.task_name, "phase": "*", "gpu_id": state.gpu_id,
+                                           "return_code": return_code, "reason": "process_failed"})
+                    log(failure_message)
+                    terminate_all_running()
+                    running_states.clear()
+                    break
+            if not has_failure and len(running_states) > 0:
+                time.sleep(POLL_INTERVAL_SEC)
+        harvest(final=True)
+        if not has_failure and remaining:
+            has_failure = True
+            failure_message = f"workers exited with unfinished units: {sorted(remaining)}"
+            log(failure_message)
+        pending_tasks = deque(t for t in tasks if any(task_rates[t][p] is None for p in phases))
+        if not has_failure:
+            pending_tasks.clear()
+
+    # Launch initial tasks for each GPU up to capacity (one process per task; nothing is
+    # pending here after persistent workers finished, and nothing launches after a failure).
+    if not has_failure:
+        for gpu_id in gpu_ids:
+            try_launch_pending(gpu_id)
 
     while len(running_states) > 0:
         progressed = False

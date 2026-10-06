@@ -130,6 +130,9 @@ def _ensure_policy_symlink(robotwin_root: Path, policy_source_dir: Path) -> Path
     )
 
 
+UNIT_BEGIN, UNIT_END = "@@EVAL_UNIT_BEGIN", "@@EVAL_UNIT_END"   # printed by script/eval_policy.py
+
+
 def _format_override_value(value: Any) -> str:
     if isinstance(value, bool):
         return "True" if value else "False"
@@ -162,7 +165,10 @@ def _append_override(overrides: list[str], key: str, value: Any, *, skip_none: b
 def main(cfg: DictConfig):
     if cfg.ckpt is None:
         raise ValueError("`ckpt` must not be None.")
-    if cfg.EVALUATION.task_name is None:
+    # Worker mode (run_robotwin_manager.py, persistent workers): the units file lists the
+    # (task, task_config) units; this process loads the model once and claims them in turn.
+    worker_units_file = cfg.EVALUATION.get("worker_units_file")
+    if cfg.EVALUATION.task_name is None and not worker_units_file:
         raise ValueError("`EVALUATION.task_name` must not be None.")
 
     ckpt_path = _resolve_path(str(cfg.ckpt), base=PROJECT_ROOT)
@@ -192,9 +198,8 @@ def main(cfg: DictConfig):
         / run_ts
     )
     run_output_dir.mkdir(parents=True, exist_ok=True)
-    log_file = run_output_dir / (
-        f"eval_{str(cfg.EVALUATION.task_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    )
+    log_name = f"worker_gpu{cfg.gpu_id}_{os.getpid()}" if worker_units_file else str(cfg.EVALUATION.task_name)
+    log_file = run_output_dir / f"eval_{log_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     robotwin_eval_base = (
         PROJECT_ROOT
         / "evaluate_results"
@@ -210,8 +215,11 @@ def main(cfg: DictConfig):
     dataset_stats_path = _resolve_dataset_stats_path(cfg, ckpt_path)
 
     overrides: list[str] = []
-    _append_override(overrides, "task_name", cfg.EVALUATION.task_name)
-    _append_override(overrides, "task_config", cfg.EVALUATION.task_config)
+    if worker_units_file:
+        _append_override(overrides, "worker_units_file", str(worker_units_file))
+    else:
+        _append_override(overrides, "task_name", cfg.EVALUATION.task_name)
+        _append_override(overrides, "task_config", cfg.EVALUATION.task_config)
     _append_override(overrides, "ckpt_setting", str(ckpt_path))
     _append_override(overrides, "seed", cfg.seed)
     _append_override(overrides, "policy_name", cfg.EVALUATION.policy_name)
@@ -220,7 +228,10 @@ def main(cfg: DictConfig):
 
     _append_override(overrides, "sim_cfg_path", str(sim_cfg_path))
     _append_override(overrides, "sim_task", sim_task)
-    _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
+    if not worker_units_file:
+        _append_override(overrides, "eval_output_dir", str(robotwin_eval_base))
+    for key in ("expert_cache_dir", "prompt_cache_dir"):
+        _append_override(overrides, key, _resolve_optional_path(cfg.EVALUATION.get(key), base=PROJECT_ROOT))
     _append_override(overrides, "mixed_precision", cfg.mixed_precision)
     _append_override(overrides, "device", cfg.EVALUATION.device)
     _append_override(overrides, "dataset_stats_path", str(dataset_stats_path))
@@ -294,21 +305,45 @@ def main(cfg: DictConfig):
             bufsize=1,
         )
         assert process.stdout is not None
+        unit_log = None   # worker mode: each unit's lines also go to its own eval_<task>_<ts>.log
         for line in process.stdout:
             sys.stdout.write(line)
             sys.stdout.flush()
-            log_f.write(line)
+            # The worker log carries wall-clock stamps (per-unit logs stay as RoboTwin prints them).
+            log_f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {line}" if worker_units_file else line)
             log_f.flush()
+            if line.startswith(UNIT_BEGIN):
+                task_name = line.split()[1]
+                unit_log = (run_output_dir / f"eval_{task_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log").open(
+                    "w", encoding="utf-8")
+            if unit_log is not None:
+                unit_log.write(line)
+                unit_log.flush()
+            if line.startswith(UNIT_END):
+                unit_log.close()
+                unit_log = None
+                _, task_name, task_config = line.split()
+                _save_eval_config(cfg, run_output_dir, task_name, task_config)
+        if unit_log is not None:
+            unit_log.close()
         return_code = process.wait()
 
     if return_code != 0:
         raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")
 
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
-    OmegaConf.save(
-        config=cfg,
-        f=str(run_output_dir / f"eval_config_{str(cfg.EVALUATION.task_name)}.yaml"),
-    )
+    if not worker_units_file:
+        OmegaConf.save(
+            config=cfg,
+            f=str(run_output_dir / f"eval_config_{str(cfg.EVALUATION.task_name)}.yaml"),
+        )
+
+
+def _save_eval_config(cfg: DictConfig, run_output_dir: Path, task_name: str, task_config: str) -> None:
+    unit_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    unit_cfg.EVALUATION.task_name = task_name
+    unit_cfg.EVALUATION.task_config = task_config
+    OmegaConf.save(config=unit_cfg, f=str(run_output_dir / f"eval_config_{task_name}.yaml"))
 
 
 if __name__ == "__main__":
