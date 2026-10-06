@@ -78,6 +78,7 @@ run() {   # name accelerate_config num_processes accumulation max_microsteps [pr
 }
 
 DS0189=/gpfs/scratch1/shared/faster-wams/deepspeed_0.18.9
+# Deleted 2026-09-26 (resume check done, jobs 27198328/27183780): resume_ds0185/0189 need a new state.
 RESUME=runs/flowmap_fulljoint/libero_lmd_100_s42_20260918/checkpoints/state/step_000050
 for v in "${variants[@]}"; do
   case $v in
