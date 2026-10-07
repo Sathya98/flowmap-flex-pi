@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task=18
 #SBATCH --mem=460G
 #SBATCH --time=24:00:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%j.out
 #SBATCH --error=slurm_logs/slurm-%x-%j.out
 # Build (or continue) a latent cache: init on one GPU if the cache is new,
@@ -27,7 +26,10 @@ config_name="${2:?Pass the Hydra config name}"
 stride="${3:-1}"
 limit="${4:-0}"
 echo "cache_latents: out=$out config=$config_name stride=$stride limit=$limit tasks=$SLURM_NTASKS"
-source /gpfs/scratch1/shared/faster-wams/env_flexpi.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi.sh
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=2
 export TOKENIZERS_PARALLELISM=false

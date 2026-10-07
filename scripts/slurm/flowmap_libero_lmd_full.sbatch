@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=384G
 #SBATCH --time=24:00:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%j.out
 #SBATCH --error=slurm_logs/slurm-%x-%j.out
 
@@ -20,7 +19,11 @@ target_steps="${3:-}"
 case "$phase" in hardware|train) ;; *) exit 2 ;; esac
 [[ "$run_dir" = /* ]] || { echo 'Run directory must be absolute' >&2; exit 2; }
 [[ ! -e "$run_dir/STOP" ]] || exit 0
-source /gpfs/scratch1/shared/faster-wams/env_flexpi.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi.sh
+repo_root="$PWD"   # continuations are submitted from here
 # Execute the frozen source snapshot, not a later working-tree revision.
 export FLEXPI_ROOT="$run_dir/code"
 export FLOWMAP_RUN_DIR="$run_dir"
@@ -129,7 +132,7 @@ fi
 if [[ "$(python scripts/flowmap_run_state.py complete "$run_dir")" = 1 || -e "$run_dir/STOP" ]]; then
   exit 0
 fi
-next_job="$(sbatch --parsable --time=24:00:00 --job-name="$SLURM_JOB_NAME" --dependency="afterok:$SLURM_JOB_ID" \
+next_job="$(cd "$repo_root" && sbatch --parsable --time=24:00:00 --job-name="$SLURM_JOB_NAME" --dependency="afterok:$SLURM_JOB_ID" \
   "$FLEXPI_ROOT/scripts/slurm/flowmap_libero_lmd_full.sbatch" "$run_dir" train "$target_steps")"
 printf '%s\n' "$next_job" >> "$run_dir/continuation_jobs.txt"
 echo "Checkpoint validated; continuation job=$next_job"

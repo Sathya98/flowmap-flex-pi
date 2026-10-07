@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=384G
 #SBATCH --time=02:00:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%j.out
 #SBATCH --error=slurm_logs/slurm-%x-%j.out
 # Where does a training microstep's wall time go? Runs the real trainer
@@ -23,7 +22,7 @@
 #   lsd_zero2    4 GPUs, patched ZeRO-2, LSD self-distillation, one full 48-microstep
 #                update (stratified diagonal/off-diagonal mixture, §6 of the notes)
 #   zero2_ds0189 as zero2 but DeepSpeed 0.18.9 (upstream hook fix; our patch skips itself),
-#                from the side install /gpfs/scratch1/shared/faster-wams/deepspeed_0.18.9
+#                from the side install ../deepspeed_0.18.9 (next to the repo)
 #   resume_ds0185 / resume_ds0189  resume the LMD-100 step-50 ZeRO-2 state (saved with
 #                0.18.5) and run past one optimizer step: checkpoint compatibility
 #   zero2_tvm    as zero2 with flow_map.jvp_attention=tvm (fused attention JVP)
@@ -46,7 +45,10 @@ config_name="${1:-flowmap_libero_lmd_full}"
 shift || true
 variants=("$@")
 [[ ${#variants[@]} -gt 0 ]] || variants=(single zero2 zero2_overlap ddp)
-source /gpfs/scratch1/shared/faster-wams/env_flexpi.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi.sh
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=2 TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 NCCL_DEBUG=WARN
@@ -77,7 +79,7 @@ run() {   # name accelerate_config num_processes accumulation max_microsteps [pr
   echo "=== $name exit ${PIPESTATUS[0]}"
 }
 
-DS0189=/gpfs/scratch1/shared/faster-wams/deepspeed_0.18.9
+DS0189="$FLEXPI_ROOT/../deepspeed_0.18.9"
 # Deleted 2026-09-26 (resume check done, jobs 27198328/27183780): resume_ds0185/0189 need a new state.
 RESUME=runs/flowmap_fulljoint/libero_lmd_100_s42_20260918/checkpoints/state/step_000050
 for v in "${variants[@]}"; do

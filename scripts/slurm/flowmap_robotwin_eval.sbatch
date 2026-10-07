@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=384G
 #SBATCH --time=12:00:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%j.out
 #SBATCH --error=slurm_logs/slurm-%x-%j.out
 # RoboTwin simulator evaluation of one checkpoint over several NFEs (flow map or FM).
@@ -34,7 +33,10 @@ if [[ -f "${1:?NAME or SPECFILE}" ]]; then specs=$(grep -v '^\s*#' "$1" | grep .
 while IFS='|' read -r name ckpt stats; do
   [[ -f "$ckpt" && -f "$stats" ]] || { echo "Missing $ckpt or $stats" >&2; exit 2; }
 done <<< "$specs"
-source /gpfs/scratch1/shared/faster-wams/env_flexpi_robotwin.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi_robotwin.sh
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4
 echo "[fm-rt-eval] $(wc -l <<< "$specs") checkpoint(s)  nfes=[$nfes]  tasks=[$tasks]  episodes=$episodes  phases=[$phases]  per_gpu=$per_gpu  rev=$(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,memory.total --format=csv

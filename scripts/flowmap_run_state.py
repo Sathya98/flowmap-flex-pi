@@ -5,6 +5,15 @@ import math
 from pathlib import Path
 
 
+def in_run(root, path):
+    """A path the trainer recorded inside the run directory, re-rooted at ``root``: the run
+    stays valid after being moved or copied (records keep their absolute save-time paths)."""
+    path=Path(path); parts=path.parts
+    if root.name in parts:
+        return root.joinpath(*parts[len(parts)-1-parts[::-1].index(root.name)+1:])
+    return path
+
+
 def latest_state(root):
     states = sorted((root/'checkpoints/state').glob('step_*/trainer_state.json'))
     return states[-1].parent if states else None
@@ -25,7 +34,7 @@ def validate_segment(root, initial_step=0, minimum_bytes=1_000_000_000):
     step=int(status['step']); horizon=int(status['max_steps'])
     if not initial_step < step <= horizon:
         raise ValueError('Segment must make progress within the planned horizon')
-    state=Path(status['state_path'])
+    state=in_run(root,status['state_path'])
     progress=json.loads((state/'trainer_state.json').read_text())
     if (progress['global_step'] != step or progress.get('max_steps') != horizon
             or not progress.get('flowmap_ema_updates', 0)):
@@ -64,7 +73,7 @@ def validate_segment(root, initial_step=0, minimum_bytes=1_000_000_000):
         if not math.isfinite(row['val_loss']):
             raise ValueError('Nonfinite fixed-preview residual')
         for rank in range(4):
-            video=Path(row['video_path'].replace('rank_000',f'rank_{rank:03d}'))
+            video=in_run(root,row['video_path'].replace('rank_000',f'rank_{rank:03d}'))
             if not video.is_file() or not video.stat().st_size:
                 raise ValueError(f'Missing preview video: {video}')
     return status

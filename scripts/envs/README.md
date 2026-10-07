@@ -39,3 +39,17 @@ LIBERO's eval path (LIBERO, the flexpi policy, and robosuite's mujoco offscreen 
 never imports `cv2`, so a merged env would keep `opencv-python 4.11.0.86` alone. Before
 switching, it must reproduce a LIBERO eval. The disk saving is small, because the venvs
 already share their files through uv-cache hardlinks.
+
+## Moving the repo
+
+1. Copy `flowmap-flex-pi/` whole (`rsync -aH`): git, `data/`, `checkpoints/`, `runs/`, the
+   RoboTwin assets and the cuRobo checkout come along. Leave out `data/latent_cache/` and
+   `data/text_embeds_cache_3d/` if space is short; both can be regenerated.
+2. Copy `../.hf_home` next to it. The DINOv3 weights live there, and the jobs run with
+   `HF_HUB_OFFLINE=1`.
+3. Do not copy the venvs: run `bash flowmap-flex-pi/scripts/envs/install_envs.sh` in the new parent.
+4. `python scripts/relocate_runs.py runs/flowmap_fulljoint/*/ --apply` rewrites the old paths
+   in the runs' records and code snapshots, so their continuation jobs resume in place.
+
+The sbatch files carry no absolute paths: submit them from the repo root
+(`sbatch scripts/slurm/<job>.sbatch`); they source `../env_flexpi*.sh`.

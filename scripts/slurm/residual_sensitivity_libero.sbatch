@@ -8,11 +8,13 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=00:30:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%j.out
 #SBATCH --error=slurm_logs/slurm-%x-%j.out
 set -euo pipefail
-source /gpfs/scratch1/shared/faster-wams/env_flexpi_libero.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi_libero.sh
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MUJOCO_GL=egl OMP_NUM_THREADS=4
 export PYTHONUNBUFFERED=1
 output="eval_results/residual_sensitivity_${SLURM_JOB_ID}"

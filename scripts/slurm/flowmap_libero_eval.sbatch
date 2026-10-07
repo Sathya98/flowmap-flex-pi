@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
 #SBATCH --time=24:00:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%A_%a.out
 #SBATCH --error=slurm_logs/slurm-%x-%A_%a.out
 set -euo pipefail
@@ -16,7 +15,10 @@ eval_dir="${1:?Pass the absolute prepared evaluation directory}"
 phase="${2:?Pass smoke or sweep}"
 [[ "$eval_dir" = /* ]] || exit 2
 case "$phase" in smoke|sweep) ;; *) exit 2 ;; esac
-source /gpfs/scratch1/shared/faster-wams/env_flexpi_libero.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi_libero.sh
 export FLEXPI_ROOT="$eval_dir/code"
 export PYTHONPATH="$FLEXPI_ROOT/third_party/LIBERO:$FLEXPI_ROOT/src:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false

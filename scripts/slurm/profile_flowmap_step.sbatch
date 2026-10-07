@@ -8,7 +8,6 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=180G
 #SBATCH --time=02:00:00
-#SBATCH --chdir=/gpfs/scratch1/shared/faster-wams/flowmap-flex-pi
 #SBATCH --output=slurm_logs/slurm-%x-%j.out
 #SBATCH --error=slurm_logs/slurm-%x-%j.out
 # One-GPU profile of a flow-map training microstep (scripts/profile_flowmap_step.py).
@@ -19,7 +18,10 @@ set -euo pipefail
 config_name="${1:-flowmap_libero_lmd_full}"
 cache="${2:-data/latent_cache/libero_fulljoint_v2}"
 shift $(( $# > 2 ? 2 : $# ))
-source /gpfs/scratch1/shared/faster-wams/env_flexpi.sh
+# Runs from the submit directory: sbatch from the repo root; the env scripts sit next to it.
+cd "${SLURM_SUBMIT_DIR:-$PWD}"
+[[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
+source ../env_flexpi.sh
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=4
 export TOKENIZERS_PARALLELISM=false
