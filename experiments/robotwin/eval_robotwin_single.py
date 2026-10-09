@@ -330,7 +330,8 @@ def main(cfg: DictConfig):
             if line.startswith(UNIT_BEGIN):
                 fields = line.split()   # marker, task, task_config[, episode]
                 if len(fields) > 3:     # episode unit: one log per episode, appended over retries
-                    unit_log = (run_output_dir / f"eval_{fields[1]}_ep{int(fields[3]):03d}.log").open(
+                    setting = fields[2].removeprefix("demo_")   # clean | randomized
+                    unit_log = (run_output_dir / f"eval_{fields[1]}_{setting}_ep{int(fields[3]):03d}.log").open(
                         "a", encoding="utf-8")
                 else:
                     unit_log = (run_output_dir / f"eval_{fields[1]}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log").open(
