@@ -72,6 +72,10 @@ class Camera:
         # TODO
         self.static_camera_info_list = kwags["left_embodiment_config"]["static_camera_list"]
         self.static_camera_num = len(self.static_camera_info_list)
+        # Static cameras that observations render and return (None: all). script/eval_policy.py sets
+        # the policy's view (head_camera): the embodiment's other static cameras (front_camera) stay in
+        # the scene, so nothing else changes, but are neither ray-traced nor read.
+        self.obs_static_cameras = kwags.get("obs_static_cameras")
 
     def load_camera(self, scene):
         """
@@ -296,14 +300,18 @@ class Camera:
             setattr(self, k, self._shadow[k])
             self._shadow[k] = current
 
+    def _skip_static(self, camera_name):
+        return self.obs_static_cameras is not None and camera_name not in self.obs_static_cameras
+
     def update_picture(self):
         # camera
         if self.collect_wrist_camera:
             self.left_camera.take_picture()
             self.right_camera.take_picture()
 
-        for camera in self.static_camera_list:
-            camera.take_picture()
+        for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
+            if not self._skip_static(camera_name):
+                camera.take_picture()
 
         # ================================= sensor camera =================================
         # self.head_sensor.take_picture()
@@ -336,6 +344,8 @@ class Camera:
             res["right_camera"] = _get_config(self.right_camera)
 
         for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
+            if self._skip_static(camera_name):
+                continue
             if camera_name == "head_camera":
                 if self.collect_head_camera:
                     res[camera_name] = _get_config(camera)
@@ -377,6 +387,8 @@ class Camera:
             res["right_camera"]["rgba"] = _get_rgba(self.right_camera)
 
         for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
+            if self._skip_static(camera_name):
+                continue
             if camera_name == "head_camera":
                 if self.collect_head_camera:
                     res[camera_name] = {}
@@ -425,6 +437,8 @@ class Camera:
             res["right_camera"][f"{level}_segmentation"] = _get_segmentation(self.right_camera, level=level)
 
         for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
+            if self._skip_static(camera_name):
+                continue
             if camera_name == "head_camera":
                 if self.collect_head_camera:
                     res[camera_name] = {}
@@ -460,6 +474,8 @@ class Camera:
             res["right_camera"]["depth"] *= rgba["right_camera"]["rgba"][:, :, 3] / 255
         
         for camera, camera_name in zip(self.static_camera_list, self.static_camera_name):
+            if self._skip_static(camera_name):
+                continue
             if camera_name == "head_camera":
                 if self.collect_head_camera:
                     res[camera_name] = {}

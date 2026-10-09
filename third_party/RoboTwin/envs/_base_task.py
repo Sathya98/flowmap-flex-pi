@@ -445,9 +445,11 @@ class Base_Task(gym.Env):
         """``get_obs`` of the current state through the shadow cameras (RENDER_SHADOW_SPP)."""
         sapien.render.set_ray_tracing_samples_per_pixel(self.cameras.shadow_spp)
         self.cameras.swap_shadow()
+        kept = self.now_obs, getattr(self, "_now_obs_step", None)   # now_obs stays the main render
         try:
             return self.get_obs()
         finally:
+            self.now_obs, self._now_obs_step = kept
             self.cameras.swap_shadow()
             sapien.render.set_ray_tracing_samples_per_pixel(self.cameras.main_spp)
 
@@ -514,6 +516,7 @@ class Base_Task(gym.Env):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
 
         self.now_obs = deepcopy(pkl_dic)
+        self._now_obs_step = self.take_action_cnt   # the eval video reuses this render (_record_eval_frame)
         return pkl_dic
 
     def save_camera_rgb(self, save_path, camera_name='head_camera'):
@@ -594,18 +597,26 @@ class Base_Task(gym.Env):
         action (``force``: the final frame). Renders that one camera directly, so the video moves
         even when the policy skips the full observation between replans; each render is a
         ray-traced frame, which is why it is strided and skipped for episodes that cannot be kept
-        (``eval_video_record``, set per episode by script/eval_policy.py, which writes the videos)."""
+        (``eval_video_record``, set per episode by script/eval_policy.py, which writes the videos).
+        The frame shows the state after ``take_action_cnt`` actions, as the predicted frame it sits
+        beside: at a replan it is that observation's head view (same state, no second render);
+        otherwise the renderer is synced to the current poses first (``scene.update_render`` only:
+        ``_update_render`` would also redraw the random lights, consuming random numbers)."""
         if (self.eval_video_path is None or not getattr(self, "eval_video_record", True)
                 or getattr(self, "_eval_video_broken", False)):
             return
         if not force and self.take_action_cnt % EVAL_VIDEO_STRIDE:
             return
         try:   # a video problem must never fail an evaluation episode
-            cams = self.cameras
-            head = cams.static_camera_list[cams.static_camera_name.index("head_camera")]
-            head.take_picture()
-            rgb = head.get_picture("Color")[:, :, :3]
-            self.eval_video_frames.append((self.take_action_cnt, (rgb * 255).clip(0, 255).astype("uint8")))
+            if getattr(self, "_now_obs_step", None) == self.take_action_cnt:
+                frame = self.now_obs["observation"]["head_camera"]["rgb"]
+            else:
+                cams = self.cameras
+                head = cams.static_camera_list[cams.static_camera_name.index("head_camera")]
+                self.scene.update_render()
+                head.take_picture()
+                frame = (head.get_picture("Color")[:, :, :3] * 255).clip(0, 255).astype("uint8")
+            self.eval_video_frames.append((self.take_action_cnt, frame))
         except Exception as exc:
             print(f"[eval video] frame capture disabled: {exc!r}")
             self._eval_video_broken = True

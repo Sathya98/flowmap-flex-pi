@@ -57,6 +57,8 @@ EVALUATION:
   expert_cache_dir: evaluate_results/robotwin/.expert_cache  # expert-check outcome + episode info per seed
   prompt_cache_dir: evaluate_results/robotwin/.prompt_cache  # umT5 prompt embeddings
   worker_units_file: null  # set by run_robotwin_manager.py (persistent workers); not for direct use
+  serve_address_file: null  # set by run_robotwin_manager.py: run the policy server, publishing its address here
+  policy_server: null       # set by run_robotwin_manager.py: the server address file this worker uses
 
 MULTIRUN:
   enabled: false
@@ -66,6 +68,8 @@ MULTIRUN:
   tasks: null               # null = all tasks from _eval_step_limit.yml; or explicit list e.g. [adjust_bottle, beat_block_hammer]
   shard: null               # null = no sharding; "N/K" = block shard (this-machine N of K, 0-indexed): tasks[N*chunk:(N+1)*chunk], chunk=ceil(total/K)
   persistent_workers: true  # one process (one model load) per worker slot, claiming tasks in turn; false = one process per task
+  policy_server: false      # one policy server (the model) per GPU and envs_per_gpu simulator workers per GPU, one episode per unit
+  envs_per_gpu: 4           # simulator workers per GPU with policy_server (max_tasks_per_gpu is then unused)
 
 hydra:
   job:

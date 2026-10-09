@@ -30,6 +30,8 @@ from flexpi.datasets.lerobot.utils.normalizer import load_dataset_stats_from_jso
 from flexpi.per_cam_compose import compose_robotwin_from_per_cam
 from flexpi.datasets.lerobot.robot_video_dataset import _PER_CAM_HW
 
+from .policy_server import RemotePolicy, authkey_from_env, frames_per_step
+
 logger = logging.getLogger(__name__)
 
 
@@ -795,15 +797,9 @@ class WorldActionRobotWinPolicy:
             self.pending_actions.append(np.asarray(action_chunk[i], dtype=np.float32))
 
     @torch.no_grad()
-    def prediction_frames(self, num_steps, frame_hw):
-        """Per executed step, the model's decoded prediction of the head camera (or None).
-
-        Each replan at step k0 predicted a clip whose frame j shows step k0 + j * stride,
-        with stride = action_horizon / (frames - 1) (frame 0 is the current observation).
-        The head camera is the layout slot mapped to ``cam_high``, resized to ``frame_hw``.
-        """
-        if not self._predictions:
-            return None
+    def decode_head_clips(self, latents_list, frame_hw):
+        """Decoded head-camera clips ([h, w, 3] uint8 frames) of predicted video latents. The head
+        camera is the layout slot mapped to ``cam_high``, resized to ``frame_hw``."""
         import cv2
         layout = getattr(self.model, "_layout", None)
         keys = getattr(self.model, "_slot_key_map", {}) or {}
@@ -811,18 +807,29 @@ class WorldActionRobotWinPolicy:
         if layout is not None:
             slot = next((sl for sl in layout.slots if keys.get(sl.key) == "cam_high"), layout.slots[0])
         h, w = frame_hw
-        out = [None] * num_steps
-        for r, (k0, latents) in enumerate(self._predictions):
-            k1 = self._predictions[r + 1][0] if r + 1 < len(self._predictions) else num_steps
+        clips = []
+        for latents in latents_list:
             clip = self.model._decode_latents(latents.to(device=self.model.device, dtype=self.model.torch_dtype))
             clip = [np.asarray(f) for f in clip]
             if slot is not None:
                 clip = [f[slot.top:slot.top + slot.h, slot.left:slot.left + slot.w] for f in clip]
-            clip = [cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA) for f in clip]
-            stride = self.action_horizon / max(len(clip) - 1, 1)
-            for k in range(k0, min(k1, num_steps)):
-                out[k] = clip[min(int(round((k - k0) / stride)), len(clip) - 1)]
-        return out
+            clips.append([cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA) for f in clip])
+        return clips
+
+    def prediction_frames(self, num_steps, frame_hw):
+        """Per executed step, the model's decoded prediction of the head camera (or None)."""
+        if not self._predictions:
+            return None
+        clips = self.decode_head_clips([lat for _, lat in self._predictions], frame_hw)
+        return frames_per_step([k0 for k0, _ in self._predictions], clips, num_steps, self.action_horizon)
+
+    def infer_chunk(self, observation: Dict[str, Any], instruction: str, return_latents: bool = False):
+        """One replan for a remote simulator (policy_server.serve): ``(chunk, video latents or None)``.
+        The in-process path exactly; the latents are those an in-process recorded episode keeps."""
+        self.record_predictions = bool(return_latents)
+        chunk = self._infer_action_chunk(observation=observation, instruction=instruction)
+        latents = self._predictions.pop()[1] if (self.record_predictions and self._predictions) else None   # (step, latents)
+        return chunk, latents
 
     @torch.no_grad()
     def render_divergence(self, observation, shadow_observation, instruction, decode=True):
@@ -949,6 +956,12 @@ def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
 
 
 def get_model(usr_args: Dict[str, Any]):
+    # Policy-server mode (run_robotwin_manager.py, MULTIRUN.policy_server): this simulator process
+    # loads no model; replans go to the server named by the address file.
+    if not _is_none_like(usr_args.get("policy_server")):
+        return RemotePolicy(str(usr_args["policy_server"]), authkey_from_env(),
+                            timing_enabled=_parse_bool(usr_args.get("timing_enabled") or False))
+
     sim_cfg_path = usr_args.get("sim_cfg_path")
     sim_cfg_name = usr_args.get("sim_cfg_name")
     sim_task = usr_args.get("sim_task")

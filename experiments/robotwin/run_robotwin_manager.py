@@ -1,7 +1,9 @@
+import atexit
 import csv
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -21,6 +23,7 @@ SINGLE_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "eval_robotwin_single
 EVAL_STEP_LIMIT_FILE = PROJECT_ROOT / "third_party" / "RoboTwin" / "task_config" / "_eval_step_limit.yml"
 TERMINATE_TIMEOUT_SEC = 10
 POLL_INTERVAL_SEC = 2
+AUTHKEY_ENV = "FLEXPI_POLICY_AUTHKEY"   # as flexpi_policy/policy_server.py
 
 
 def _resolve_path(path_str: str, *, base: Path) -> Path:
@@ -57,6 +60,8 @@ def _is_blocked_override(raw_override: str) -> bool:
         "EVALUATION.task_config",
         "EVALUATION.output_dir",
         "EVALUATION.worker_units_file",
+        "EVALUATION.serve_address_file",
+        "EVALUATION.policy_server",
     }:
         return True
     return key.startswith("MULTIRUN.") or key.startswith("hydra.")
@@ -379,24 +384,59 @@ def main(cfg: DictConfig):
     has_failure = False
     failure_message = ""
 
-    if bool(cfg.MULTIRUN.get("persistent_workers", False)) and len(pending_tasks) > 0:
+    use_server = bool(cfg.MULTIRUN.get("policy_server", False))
+    if (use_server or bool(cfg.MULTIRUN.get("persistent_workers", False))) and len(pending_tasks) > 0:
         # Persistent workers: max_tasks_per_gpu processes per GPU, each loading the model once
         # and claiming the next unfinished (task, phase) unit from a shared list until none is
         # left (eval_policy.py: mkdir in .claims is the atomic claim). Results are harvested
         # from the result files as they appear; a failed worker stops all (rerun resumes).
-        units = [(t, p) for t in pending_tasks for p in phases if task_rates[t][p] is None]
+        #
+        # Policy server (MULTIRUN.policy_server): one server process per GPU holds the model
+        # (serve_robotwin_policy.py), and envs_per_gpu simulator workers per GPU send it their
+        # replans. A unit is then one episode (eval_policy.py run_episode_unit), so the workers
+        # spread over the tasks' episodes; a task's episodes are merged into its _result file.
+        n_episodes = int(cfg.EVALUATION.eval_num_episodes)
+        if use_server:   # episode-major: every task's first episodes start together
+            units = [(t, p, i) for i in range(n_episodes) for t in pending_tasks for p in phases
+                     if task_rates[t][p] is None]
+        else:
+            units = [(t, p, None) for t in pending_tasks for p in phases if task_rates[t][p] is None]
+
+        def episode_file(t: str, p: str, i: int) -> Path:
+            return run_output_dir / t / f"_episodes_{p}" / f"{i:03d}.json"
+
         claim_dir = run_output_dir / ".claims"
         shutil.rmtree(claim_dir, ignore_errors=True)   # claims of a previous (dead) manager run
         claim_dir.mkdir()
         units_file = run_output_dir / ".worker_units.json"
         units_file.write_text(json.dumps({"claim_dir": str(claim_dir), "units": [
             {"task_name": t, "task_config": phase_to_task_config[p], "eval_output_dir": str(run_output_dir / t),
-             "result_file": str(run_output_dir / t / _phase_result_filename(p))} for t, p in units]}, indent=1))
-        remaining = set(units)
+             **({"episode": i, "result_file": str(episode_file(t, p, i))} if i is not None else
+                {"result_file": str(run_output_dir / t / _phase_result_filename(p))})}
+            for t, p, i in units]}, indent=1))
+        remaining = {(t, p) for t, p, _ in units}
+
+        def merge_episodes(t: str, p: str) -> None:
+            """Write the task's _result file (as script/eval_policy.py run_task) once every episode is in."""
+            files = [episode_file(t, p, i) for i in range(n_episodes)]
+            if not all(f.exists() for f in files):
+                return
+            episodes = [json.loads(f.read_text()) for f in files]
+            rate = sum(bool(e["success"]) for e in episodes) / n_episodes
+            (run_output_dir / t / f"episodes_{p}.json").write_text(json.dumps(episodes, indent=1))
+            (run_output_dir / t / _phase_result_filename(p)).write_text(
+                f"Timestamp: {datetime.now().strftime('%Y%m%d_%H%M%S')}\n\n"
+                f"Instruction Type: {cfg.EVALUATION.instruction_type}\n\n{rate}")
 
         def harvest(final: bool) -> None:
             for t, p in sorted(remaining):
                 result_file = run_output_dir / t / _phase_result_filename(p)
+                if use_server and not result_file.exists():
+                    try:
+                        merge_episodes(t, p)
+                    except Exception as exc:   # an episode file being replaced; next poll
+                        if final:
+                            log(f"episode merge failed: task={t}, phase={p}, error={repr(exc)}")
                 if not result_file.exists():
                     continue
                 try:
@@ -408,17 +448,66 @@ def main(cfg: DictConfig):
                 remaining.discard((t, p))
                 log(f"done task={t} phase={p} success_rate={task_rates[t][p]:.4f}")
 
-        n_workers = min(num_gpus * max_tasks_per_gpu, len(units))
+        servers: dict[int, tuple[Path, subprocess.Popen[str]]] = {}
+
+        def killpg(proc: subprocess.Popen[str], sig: int) -> None:
+            try:
+                os.killpg(proc.pid, sig)
+            except ProcessLookupError:
+                pass
+
+        def stop_servers() -> None:
+            # Each server runs in its own session: the signal reaches eval_robotwin_single.py and
+            # the serve_robotwin_policy.py process under it, so the GPU memory is freed now.
+            for _, proc in servers.values():
+                killpg(proc, signal.SIGTERM)
+            deadline = time.time() + TERMINATE_TIMEOUT_SEC
+            for addr, proc in servers.values():
+                try:
+                    proc.wait(timeout=max(0.0, deadline - time.time()))
+                except subprocess.TimeoutExpired:
+                    pass
+                killpg(proc, signal.SIGKILL)   # the server itself, if it outlived its parent
+                proc.wait()
+                addr.unlink(missing_ok=True)
+            servers.clear()
+
+        atexit.register(stop_servers)   # also when the manager dies of an exception
+        if use_server:
+            envs_per_gpu = int(cfg.MULTIRUN.get("envs_per_gpu", 4))
+            os.environ.setdefault(AUTHKEY_ENV, os.urandom(16).hex())   # inherited by servers and workers
+            for gpu_id in gpu_ids:
+                addr = run_output_dir / f".policy_server_gpu{gpu_id}.json"
+                addr.unlink(missing_ok=True)
+                cmd = [sys.executable, str(SINGLE_ENTRY), f"ckpt={str(ckpt_path)}", f"gpu_id={gpu_id}",
+                       f"EVALUATION.serve_address_file={str(addr)}", f"EVALUATION.output_dir={str(output_dir)}",
+                       *extra_overrides]
+                log(f"launch policy server gpu={gpu_id} cmd={' '.join(cmd)}")
+                servers[gpu_id] = (addr, subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), text=True, start_new_session=True))
+
+        # Workers start right away; with a policy server they wait for its address file.
+        n_workers = min(num_gpus * (envs_per_gpu if use_server else max_tasks_per_gpu), len(units))
         for k in range(n_workers):
             gpu_id = gpu_ids[k % num_gpus]
             cmd = [sys.executable, str(SINGLE_ENTRY), f"ckpt={str(ckpt_path)}", f"gpu_id={gpu_id}",
                    f"EVALUATION.worker_units_file={str(units_file)}", f"EVALUATION.output_dir={str(output_dir)}",
+                   *([f"EVALUATION.policy_server={str(servers[gpu_id][0])}"] if use_server else []),
                    *extra_overrides]
             log(f"launch worker={k} gpu={gpu_id} units={len(units)} cmd={' '.join(cmd)}")
             running_states.append(RunningState(task_name=f"worker{k}", gpu_id=gpu_id, phase="*",
                                                process=subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), text=True)))
         while len(running_states) > 0:
             harvest(final=False)
+            for gpu_id, (_, proc) in servers.items():
+                if proc.poll() is not None:
+                    has_failure = True
+                    failure_message = f"policy server on gpu={gpu_id} exited with return_code={proc.returncode}"
+                    failed_records.append({"task_name": f"server_gpu{gpu_id}", "phase": "*", "gpu_id": gpu_id,
+                                           "return_code": proc.returncode, "reason": "server_failed"})
+                    log(failure_message)
+                    terminate_all_running()
+                    running_states.clear()
+                    break
             for state in list(running_states):
                 return_code = state.process.poll()
                 if return_code is None:
@@ -435,6 +524,7 @@ def main(cfg: DictConfig):
                     break
             if not has_failure and len(running_states) > 0:
                 time.sleep(POLL_INTERVAL_SEC)
+        stop_servers()
         harvest(final=True)
         if not has_failure and remaining:
             has_failure = True

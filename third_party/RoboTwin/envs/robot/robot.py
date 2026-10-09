@@ -13,6 +13,45 @@ import sapien.core as sapien
 import envs._GLOBAL_CONFIGS as CONFIGS
 from envs.utils import transforms
 from .planner import CuroboPlanner
+
+# Build the cuRobo planners on first use (default) instead of at the first scene setup of a process:
+# they hold ~4 GB of GPU memory per process, and only planned motions (expert demonstrations,
+# end-effector actions) use them; joint-position rollouts never do. ROBOTWIN_LAZY_CUROBO=0 restores
+# the eager build.
+LAZY_CUROBO = os.environ.get("ROBOTWIN_LAZY_CUROBO", "1") != "0"
+
+
+class LazyCuroboPlanner:
+    """A CuroboPlanner built, with the same arguments, the first time it is used. The global random
+    states (numpy, random, torch) are restored around the build, so building late leaves every
+    random stream as building at setup did (the build consumes none that the scene uses)."""
+
+    def __init__(self, *args, **kwargs):
+        self._args, self._kwargs, self._planner = args, kwargs, None
+
+    def _get(self):
+        if self._planner is None:
+            import random
+            import torch
+            states = (np.random.get_state(), random.getstate(), torch.get_rng_state(),
+                      torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None)
+            try:
+                self._planner = CuroboPlanner(*self._args, **self._kwargs)
+            finally:
+                np.random.set_state(states[0])
+                random.setstate(states[1])
+                torch.set_rng_state(states[2])
+                if states[3] is not None:
+                    torch.cuda.set_rng_state_all(states[3])
+        return self._planner
+
+    def plan_grippers(self, now_val, target_val):   # linear interpolation, no planner needed
+        return CuroboPlanner.plan_grippers(self, now_val, target_val)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._get(), name)
 import torch.multiprocessing as mp
 
 
@@ -132,7 +171,8 @@ class Robot:
                 self.right_conn.send({"cmd": "reset"})
                 _ = self.right_conn.recv()
         else:
-            if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
+            planners = (CuroboPlanner, LazyCuroboPlanner)
+            if not isinstance(self.left_planner, planners) or not isinstance(self.right_planner, planners):
                 self.set_planner(scene=scene)
 
         self.init_joints()
@@ -265,11 +305,12 @@ class Robot:
             abs_right_curobo_yml_path = abs_right_curobo_yml_path.replace("curobo.yml", "curobo_right.yml")
 
         if not self.communication_flag:
-            self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
+            make = LazyCuroboPlanner if LAZY_CUROBO else CuroboPlanner
+            self.left_planner = make(self.left_entity_origion_pose,
                                               self.left_arm_joints_name,
                                               [joint.get_name() for joint in self.left_entity.get_active_joints()],
                                               yml_path=abs_left_curobo_yml_path)
-            self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
+            self.right_planner = make(self.right_entity_origion_pose,
                                                self.right_arm_joints_name,
                                                [joint.get_name() for joint in self.right_entity.get_active_joints()],
                                                yml_path=abs_right_curobo_yml_path)
