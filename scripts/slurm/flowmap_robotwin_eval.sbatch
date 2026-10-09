@@ -25,7 +25,8 @@
 # warm expert cache (37.3 GB peak measured), 3 when the tasks' seeds are checked for the first
 # time (cold cache, 30.2 GB peak at 3). 94 GB H100: ~12 either way (then CPU-bound).
 # ENVS_PER_GPU_COLD (default ENVS_PER_GPU) applies to each checkpoint's first NFE, which visits
-# every episode's seed and so fills the expert cache; the later NFEs run warm.
+# every episode's seed and so fills the expert cache; the later NFEs run warm. Each retry of an
+# NFE runs one simulator per GPU fewer (a crash may be GPU memory running out).
 # Several jobs may share one spec file (e.g. on H100 and A100, whichever starts first): a
 # checkpoint whose results are complete is skipped, one locked by another RUNNING job is
 # skipped, and a lock left by a dead or timed-out job is taken over (the manager resumes).
@@ -105,7 +106,8 @@ for nfe in $nfes; do
   # The manager stops every worker when one fails; rerunning it resumes (finished tasks are
   # skipped), so a killed or crashed task costs one retry, not the whole NFE.
   for attempt in 1 2 3; do
-    echo "=== NFE $nfe attempt $attempt  $(date)"
+    envs_try=$(( envs_now - attempt + 1 > 0 ? envs_now - attempt + 1 : 1 ))
+    echo "=== NFE $nfe attempt $attempt  $(date)$([[ $server = 1 ]] && echo "  envs/GPU=$envs_try")"
     if python experiments/robotwin/run_robotwin_manager.py \
       task=robotwin_unified_flex_3cam_384_1e-4 seed=42 \
       ckpt="$ckpt" EVALUATION.dataset_stats_path="$stats" \
@@ -117,7 +119,7 @@ for nfe in $nfes; do
       +EVALUATION.infer_joint_video=true +EVALUATION.infer_joint_dino=true +EVALUATION.infer_joint_pointmap=true \
       +EVALUATION.infer_present_video=true +EVALUATION.infer_present_dino=true +EVALUATION.infer_present_pointmap=true \
       MULTIRUN.num_gpus=4 MULTIRUN.max_tasks_per_gpu="$per_gpu" \
-      MULTIRUN.policy_server="$([[ $server = 1 ]] && echo true || echo false)" MULTIRUN.envs_per_gpu="$envs_now" \
+      MULTIRUN.policy_server="$([[ $server = 1 ]] && echo true || echo false)" MULTIRUN.envs_per_gpu="$envs_try" \
       "MULTIRUN.phases=[$phases]" "MULTIRUN.tasks=[$tasks]" \
       EVALUATION.output_dir="evaluate_results/robotwin/_/${name}_nfe${nfe}" < /dev/null; then
       break
