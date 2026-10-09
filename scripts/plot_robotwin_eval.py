@@ -169,9 +169,10 @@ def grid_figure(models, nfe, out):
     fig.suptitle(f"RoboTwin per-task success, NFE {nfe}", x=0.012, ha="left", fontsize=14, fontweight="bold",
                  color=INK, y=0.985)
     fig.text(0.012, 0.012, f"Dot and number: observed success in {EPISODES} episodes. Violin: posterior of the "
-             f"task's success rate given that count (Beta(k+1, {EPISODES + 1}−k)); wider = less certain. "
-             "Clean scenes, the same episodes for every model.", fontsize=8.5, color=INK2)
-    fig.subplots_adjust(left=0.05, right=0.99, top=0.84, bottom=0.08, wspace=0.08, hspace=0.32)
+             f"task's success rate given that count (Beta(k+1, {EPISODES + 1}−k)); wider = less certain.\n"
+             "Clean scenes; episodes = the first seeds passing the (non-deterministic) expert check, so they can "
+             "differ between models.", fontsize=8.5, color=INK2, linespacing=1.4)
+    fig.subplots_adjust(left=0.05, right=0.99, top=0.84, bottom=0.095, wspace=0.08, hspace=0.32)
     fig.savefig(f"{out}_nfe{nfe}_grid.png", dpi=200, facecolor=SURFACE)
     return f"{out}_nfe{nfe}_grid.png"
 

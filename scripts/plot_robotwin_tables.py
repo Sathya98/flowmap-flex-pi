@@ -1,7 +1,8 @@
 """RoboTwin success tables for slides: one PNG per NFE, tasks x checkpoints.
 
-Cells are the task's success rate over 10 episodes (clean scenes, seed 42, same episodes
-for every model), tinted by the difference from the FM baseline on that task (blue
+Cells are the task's success rate over 10 episodes (clean scenes, seed 42: the first 10 seeds
+that pass RoboTwin's expert check; these runs predate the shared expert cache, and cuRobo planning
+is not deterministic, so for some tasks the episode set differs between models), tinted by the difference from the FM baseline on that task (blue
 better, red worse; no tint when equal). The bottom row is the mean over the 10 tasks
 ± its standard error over the 100 pooled episodes, sqrt(p(1-p)/100). A dash is an eval
 that has not run yet; a mean over fewer than 10 tasks is shown muted with the task count.
@@ -98,10 +99,11 @@ def table(nfe, out):
         x += col_w * len(members)
         ax.plot([x, x], [0.62, y + row_h + 0.1], color=RULE, linewidth=0.8)
     ax.plot([task_w, task_w], [0.62, y + row_h + 0.1], color=RULE, linewidth=0.8)
-    note = (f"Success rate over {EPISODES} episodes per task (clean scenes, unseen instructions; the same episodes "
-            "for every model), full joint generation, EMA 0.995 weights.\n"
-            "Tint: better / worse than the FM baseline on that task (darker: by 0.3 or more). One episode is 0.1. "
-            "s.e. = sqrt(p(1−p)/100) over the 100 pooled episodes. Dash: not evaluated yet.")
+    note = (f"Success rate over {EPISODES} episodes per task (clean scenes, unseen instructions), full joint generation, "
+            "EMA 0.995 weights. Episodes: the first 10 seeds passing RoboTwin's expert check, which is not deterministic,\n"
+            "so for some tasks (most: hanging mug, place can basket, place fan) the episode set differs between models. "
+            "Tint: better / worse than the FM baseline on that task (darker: by 0.3 or more).\n"
+            "One episode is 0.1. s.e. = sqrt(p(1−p)/100) over the 100 pooled episodes. Dash: not evaluated yet.")
     ax.text(0, y + row_h + 0.42, note, va="top", fontsize=7.5, color=INK2, linespacing=1.5)
     fig.savefig(f"{out}_nfe{nfe}.png", dpi=220, facecolor=SURFACE)
     plt.close(fig)

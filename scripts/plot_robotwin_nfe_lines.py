@@ -49,7 +49,7 @@ def figure(models, nfes, out):
                  color=INK, y=0.985)
     fig.text(0.012, 0.012, f"Point: success in {EPISODES} episodes at that NFE; bars: 95% Wilson interval. "
              "Lines are shifted sideways slightly so overlapping points stay visible. "
-             "Clean scenes, the same episodes for every model.", fontsize=8.5, color=INK2)
+             "Clean scenes; episodes = the first seeds passing the (non-deterministic) expert check, so they can differ between models.", fontsize=8.5, color=INK2)
     fig.subplots_adjust(left=0.045, right=0.825, top=0.9, bottom=0.09, wspace=0.08, hspace=0.3)
     fig.savefig(f"{out}.png", dpi=200, facecolor=SURFACE)
     return f"{out}.png"
