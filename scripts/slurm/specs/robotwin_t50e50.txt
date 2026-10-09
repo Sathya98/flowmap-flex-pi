@@ -1,0 +1,8 @@
+# 50-task RoboTwin eval, 50 clean + 50 randomized episodes per task (NAME|CKPT|STATS).
+# Submit 3 jobs on this file (each claims one checkpoint); see scripts/slurm/flowmap_robotwin_eval.sbatch:
+#   T=$(python3 -c "import yaml; print(','.join(yaml.safe_load(open('third_party/RoboTwin/task_config/_eval_step_limit.yml'))))")
+#   sbatch --job-name=fm-rt-t50 --mem=600G --time=24:00:00 --export=ALL,POLICY_SERVER=1,ENVS_PER_GPU=10 \
+#     scripts/slurm/flowmap_robotwin_eval.sbatch scripts/slurm/specs/robotwin_t50e50.txt - - "1 2 4" "$T" 50 clean,random
+fm_release_s48060_t50e50|checkpoints/released/flexpi-robotwin/checkpoints/weights/step_048060.pt|checkpoints/released/flexpi-robotwin/dataset_stats.json
+lmdgrid_s1631_ema995_t50e50|runs/flowmap_fulljoint/robotwin_lmd_grid_s42_20260926/checkpoints/weights/ema_0.995/step_001631.pt|runs/flowmap_fulljoint/robotwin_lmd_grid_s42_20260926/dataset_stats.json
+lmdcurr_s1636_ema995_t50e50|runs/flowmap_fulljoint/robotwin_lmd_curriculum_s42_20260926/checkpoints/weights/ema_0.995/step_001636.pt|runs/flowmap_fulljoint/robotwin_lmd_curriculum_s42_20260926/dataset_stats.json
