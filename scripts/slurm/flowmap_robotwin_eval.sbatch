@@ -24,6 +24,8 @@
 # once it has run an expert check (cuRobo, built on first use). 40 GB A100: ENVS_PER_GPU=6 with a
 # warm expert cache (37.3 GB peak measured), 3 when the tasks' seeds are checked for the first
 # time (cold cache, 30.2 GB peak at 3). 94 GB H100: ~12 either way (then CPU-bound).
+# ENVS_PER_GPU_COLD (default ENVS_PER_GPU) applies to each checkpoint's first NFE, which visits
+# every episode's seed and so fills the expert cache; the later NFEs run warm.
 # Several jobs may share one spec file (e.g. on H100 and A100, whichever starts first): a
 # checkpoint whose results are complete is skipped, one locked by another RUNNING job is
 # skipped, and a lock left by a dead or timed-out job is taken over (the manager resumes).
@@ -36,7 +38,7 @@
 set -uo pipefail
 nfes="${4:-1 2 3 4}"; tasks="${5:?comma-separated task list}"
 episodes="${6:-10}"; phases="${7:-clean}"; per_gpu="${MAX_TASKS_PER_GPU:-2}"
-server="${POLICY_SERVER:-0}"; envs_per_gpu="${ENVS_PER_GPU:-4}"
+server="${POLICY_SERVER:-0}"; envs_per_gpu="${ENVS_PER_GPU:-4}"; envs_cold="${ENVS_PER_GPU_COLD:-$envs_per_gpu}"
 if [[ -f "${1:?NAME or SPECFILE}" ]]; then specs=$(grep -v '^\s*#' "$1" | grep .); else specs="$1|${2:?CKPT}|${3:?DATASET_STATS}"; fi
 while IFS='|' read -r name ckpt stats; do
   [[ -f "$ckpt" && -f "$stats" ]] || { echo "Missing $ckpt or $stats" >&2; exit 2; }
@@ -46,7 +48,7 @@ cd "${SLURM_SUBMIT_DIR:-$PWD}"
 [[ -d scripts/slurm ]] || { echo 'Submit from the flowmap-flex-pi root' >&2; exit 2; }
 source ../env_flexpi_robotwin.sh
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=4
-echo "[fm-rt-eval] $(wc -l <<< "$specs") checkpoint(s)  nfes=[$nfes]  tasks=[$tasks]  episodes=$episodes  phases=[$phases]  per_gpu=$per_gpu  policy_server=$server envs_per_gpu=$envs_per_gpu  rev=$(git rev-parse --short HEAD)"
+echo "[fm-rt-eval] $(wc -l <<< "$specs") checkpoint(s)  nfes=[$nfes]  tasks=[$tasks]  episodes=$episodes  phases=[$phases]  per_gpu=$per_gpu  policy_server=$server envs_per_gpu=$envs_per_gpu (first NFE: $envs_cold)  rev=$(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 # Watchdog: a simulator worker whose log has not changed for STALL_MIN minutes is stuck
 # (seen: RoboTwin's expert check looping forever on one seed at 100% CPU). Kill it; the
@@ -97,7 +99,9 @@ while IFS='|' read -r name ckpt stats; do
 if complete "$name"; then echo "##### $name: complete, skipping"; continue; fi
 if ! claim "$name"; then echo "##### $name: running in job $(cat "$LOCKS/$name/owner"), skipping"; continue; fi
 echo "##### $name  ckpt=$ckpt  $(date)"
+first_nfe=1
 for nfe in $nfes; do
+  envs_now=$envs_per_gpu; (( first_nfe )) && envs_now=$envs_cold; first_nfe=0
   # The manager stops every worker when one fails; rerunning it resumes (finished tasks are
   # skipped), so a killed or crashed task costs one retry, not the whole NFE.
   for attempt in 1 2 3; do
@@ -113,7 +117,7 @@ for nfe in $nfes; do
       +EVALUATION.infer_joint_video=true +EVALUATION.infer_joint_dino=true +EVALUATION.infer_joint_pointmap=true \
       +EVALUATION.infer_present_video=true +EVALUATION.infer_present_dino=true +EVALUATION.infer_present_pointmap=true \
       MULTIRUN.num_gpus=4 MULTIRUN.max_tasks_per_gpu="$per_gpu" \
-      MULTIRUN.policy_server="$([[ $server = 1 ]] && echo true || echo false)" MULTIRUN.envs_per_gpu="$envs_per_gpu" \
+      MULTIRUN.policy_server="$([[ $server = 1 ]] && echo true || echo false)" MULTIRUN.envs_per_gpu="$envs_now" \
       "MULTIRUN.phases=[$phases]" "MULTIRUN.tasks=[$tasks]" \
       EVALUATION.output_dir="evaluate_results/robotwin/_/${name}_nfe${nfe}" < /dev/null; then
       break
