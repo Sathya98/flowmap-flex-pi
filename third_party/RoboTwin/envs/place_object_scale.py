@@ -11,6 +11,12 @@ class place_object_scale(Base_Task):
 
     def setup_demo(self, **kwags):
         super()._init_task_env_(**kwags)
+        # check_success needs it, and a policy rollout runs no play_once: set from this scene (as
+        # play_once does, before it moves anything), not left by the expert demo of another seed.
+        self._set_arm_tag()
+
+    def _set_arm_tag(self):
+        self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
 
     def load_actors(self):
         rand_pos = rand_pose(
@@ -99,7 +105,7 @@ class place_object_scale(Base_Task):
 
     def play_once(self):
         # Determine which arm to use based on object's x position (right if positive, left if negative)
-        self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
+        self._set_arm_tag()
 
         # Grasp the object with the selected arm
         self.move(self.grasp_actor(self.object, arm_tag=self.arm_tag))

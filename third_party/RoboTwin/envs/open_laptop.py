@@ -8,6 +8,13 @@ class open_laptop(Base_Task):
 
     def setup_demo(self, is_test=False, **kwags):
         super()._init_task_env_(**kwags)
+        # check_success needs it, and a policy rollout runs no play_once: set from this scene (as
+        # play_once does, before it moves anything), not left by the expert demo of another seed.
+        self._set_arm_tag()
+
+    def _set_arm_tag(self):
+        face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
+        self.arm_tag = ArmTag("left" if face_prod > 0 else "right")
 
     def load_actors(self):
         self.model_name = "015_laptop"
@@ -30,9 +37,8 @@ class open_laptop(Base_Task):
         self.add_prohibit_area(self.laptop, padding=0.1)
 
     def play_once(self):
-        face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
-        arm_tag = ArmTag("left" if face_prod > 0 else "right")
-        self.arm_tag = arm_tag
+        self._set_arm_tag()
+        arm_tag = self.arm_tag
 
         # Grasp the laptop
         self.move(self.grasp_actor(self.laptop, arm_tag=arm_tag, pre_grasp_dis=0.08, contact_point_id=0))

@@ -1,5 +1,7 @@
 import sys
 import os
+import gc
+import socket
 import subprocess
 
 sys.path.append("./")
@@ -155,9 +157,11 @@ class ExpertCache:
     run to run) and skips the planner run and one scene setup per episode. The first outcome
     written for a seed is final, also when the check raised an error (recorded in "error"):
     workers that evaluate episodes of one task in parallel must all agree on which seeds are
-    episodes. ``claim`` / ``release`` keep two workers from running the same check at once."""
+    episodes. Errors of the process rather than the seed (``process_error``) are never written.
+    ``claim`` / ``release`` keep two workers from running the same check at once."""
 
     LOCK_STALE_S = 1800   # a compute lock older than this is abandoned (its worker died)
+    HOST = socket.gethostname()
 
     def __init__(self, root, task_name, task_config, embodiment):
         self.dir = Path(root) / task_name / task_config / embodiment if root else None
@@ -197,24 +201,74 @@ class ExpertCache:
         lock = self.dir / f".{seed}.lock"
         try:
             lock.mkdir()
-            return True
         except FileExistsError:
             try:
-                stale = time.time() - lock.stat().st_mtime > self.LOCK_STALE_S
+                stale = time.time() - lock.stat().st_mtime > self.LOCK_STALE_S or self._owner_gone(lock)
             except FileNotFoundError:
                 return self.claim(seed)   # released meanwhile
-            if stale:
-                print(f"[expert cache] taking over the stale check of seed {seed}")
-                lock.touch()
-                return True
+            if not stale:
+                return False
+            print(f"[expert cache] taking over the stale check of seed {seed}")
+            lock.touch()
+        (lock / "owner").write_text(f"{self.HOST} {os.getpid()}")
+        return True
+
+    def _owner_gone(self, lock):
+        """The lock's process has ended (a worker the manager stopped after another one failed): known
+        for locks taken on this host; others wait for LOCK_STALE_S."""
+        try:
+            host, pid = (lock / "owner").read_text().split()
+        except (FileNotFoundError, ValueError):
             return False
+        if host != self.HOST:
+            return False
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        return False
 
     def release(self, seed):
         if self.dir is not None:
+            lock = self.dir / f".{seed}.lock"
             try:
-                (self.dir / f".{seed}.lock").rmdir()
+                (lock / "owner").unlink(missing_ok=True)
+                lock.rmdir()
             except FileNotFoundError:
                 pass
+
+
+# Errors that say the process is broken (out of GPU memory, a failed CUDA or graphics call), not that
+# the seed fails its check. After one, every later check of the process can fail too: one worker
+# stored "Offset increment outside graph capture" for 1,659 seeds of a task after running out of GPU
+# memory once. The process stops instead (the manager reruns the unit) and nothing is stored.
+_PROCESS_ERROR_TEXT = ("out of memory", "cuda error", "graph capture", "cublas", "cudnn", "cannot create buffer",
+                       "vulkan", "vk::")
+
+
+def process_error(e):
+    import torch
+    return (isinstance(e, torch.OutOfMemoryError) or type(e).__name__ == "CuroboBuildError"   # envs/robot/robot.py
+            or any(t in str(e).lower() for t in _PROCESS_ERROR_TEXT))
+
+
+# Seeds whose target pad is pure black are not episodes: they are skipped as if their expert check
+# had failed. A black pad's material (base color (0, 0, 0), no specular, opaque) reflects nothing,
+# so SAPIEN's ray tracer (rt/camera.rchit) divides by a total reflectance of 0. No bounce is sampled,
+# and the next ray is traced with a zero direction. On GPUs without RT cores (A100, H100), traversal
+# of that ray sometimes never ends: the render hangs, or the GPU reports "device lost". Job 28046671
+# hung on 4 of the 7 black-pad episodes, on every retry; it hung on none of the 17 other episodes of
+# these tasks. The pad color is drawn from the seed, so the skip does not depend on the policy, and
+# every model sees the same episodes. This deviates from upstream RoboTwin, where a black pad is 1 of
+# 8 colors in move_stapler_pad and place_mouse_pad and 1 of 23 in stamp_seal and place_fan: about
+# 0.7% of the 50 tasks' episodes, which here get the next seed instead.
+_BLACK_PAD_TASKS = ("move_stapler_pad", "place_mouse_pad", "stamp_seal", "place_fan")   # pad color: info "{B}"
+
+
+def black_pad(task_name, info):
+    return task_name in _BLACK_PAD_TASKS and (info or {}).get("{B}") == "Black"
 
 
 def expert_check(TASK_ENV, args, now_id, seed, expert_cache):
@@ -243,6 +297,10 @@ def expert_check(TASK_ENV, args, now_id, seed, expert_cache):
         print(" -------------")
         TASK_ENV.close_env()
         print("error occurs !")
+        if process_error(e):
+            if expert_cache is not None:
+                expert_cache.release(seed)
+            raise
         error = repr(e)
     finally:
         args["render_freq"] = render_freq
@@ -503,9 +561,9 @@ def run_task(usr_args, model, task_name, task_config, eval_output_dir):
 
 def episode_seed(TASK_ENV, args, expert_cache, st_seed, index, lookahead=8):
     """(seed, episode_info) of what the per-task loop runs as episode ``index``: the index-th seed
-    from ``st_seed`` whose expert check passes. Missing checks are run here; while another worker
-    runs the check of a seed, up to ``lookahead`` later unchecked seeds are checked meanwhile, so
-    the workers on one task plan its seeds in parallel."""
+    from ``st_seed`` whose expert check passes and whose pad is not black (``black_pad``). Missing
+    checks are run here; while another worker runs the check of a seed, up to ``lookahead`` later
+    unchecked seeds are checked meanwhile, so the workers on one task plan its seeds in parallel."""
     passed, seed = -1, st_seed
     while True:
         entry = expert_cache.get(seed)
@@ -521,7 +579,7 @@ def episode_seed(TASK_ENV, args, expert_cache, st_seed, index, lookahead=8):
                     time.sleep(10)
                 continue
             entry = {"ok": checked[0], "info": checked[1]["info"] if checked[1] else None}
-        if entry["ok"]:
+        if entry["ok"] and not black_pad(args["task_name"], entry["info"]):
             passed += 1
             if passed == index:
                 return seed, {"info": entry["info"]}
@@ -546,6 +604,13 @@ def run_episode_unit(usr_args, model, unit, task_envs):
     args["policy_name"] = usr_args["policy_name"]
     args["eval_mode"] = True
     if task_name not in task_envs:
+        # One task env per process: each keeps its last scene, and a worker changes task nearly every
+        # unit, so keeping one per task grew its GPU memory until the GPU ran out. (The cuRobo
+        # planners outlive the env: envs/robot/robot.py shares them by robot.)
+        for old_env in task_envs.values():
+            old_env.close_env(clear_cache=True)
+        task_envs.clear()
+        gc.collect()
         task_envs[task_name] = class_decorator(task_name)
     TASK_ENV = task_envs[task_name]
 
@@ -675,6 +740,7 @@ def eval_policy(task_name,
                     print(f"[expert cache] waiting for the check of seed {now_seed} (another worker)")
                     time.sleep(10)
             expert_ok, episode_info = checked
+            expert_ok = expert_ok and not black_pad(task_name, episode_info and episode_info["info"])
 
         if (not expert_check_on) or expert_ok:
             succ_seed += 1

@@ -23,7 +23,8 @@
 # GPU memory: the server holds 15.3 GB; a simulator 3.6 GB once it has set up a scene, 5.3-6 GB
 # once it has run an expert check (cuRobo, built on first use). 40 GB A100: ENVS_PER_GPU=6 with a
 # warm expert cache (37.3 GB peak measured), 3 when the tasks' seeds are checked for the first
-# time (cold cache, 30.2 GB peak at 3). 94 GB H100: ~12 either way (then CPU-bound).
+# time (cold cache, 30.2 GB peak at 3). 94 GB H100: 12 warm (4.0-4.5 GB each), 9 cold (10 peaked
+# at 92.7 GB: a cold simulator reaches ~8 GB while it builds cuRobo).
 # ENVS_PER_GPU_COLD (default ENVS_PER_GPU) applies to each checkpoint's first NFE, which visits
 # every episode's seed and so fills the expert cache; the later NFEs run warm. Each retry of an
 # NFE runs one simulator per GPU fewer (a crash may be GPU memory running out).
@@ -93,6 +94,14 @@ claim() {      # take the checkpoint's lock unless a running job holds it
   fi
   echo "$SLURM_JOB_ID" > "$lock/owner"
 }
+gpus_ok() {    # a small CUDA op on every GPU: a faulted GPU (seen: "the launch timed out and was
+               # terminated" on every call) fails every attempt within minutes
+  timeout 300 python -c "
+import torch
+for i in range(torch.cuda.device_count()):
+    x = torch.ones(1024, 1024, device=f'cuda:{i}'); (x @ x).sum().item()
+" > /dev/null 2>&1
+}
 # Two passes: the second takes over checkpoints left behind by jobs that died or timed out
 # while this one was busy (the manager resumes their finished tasks).
 for pass in 1 2; do
@@ -107,6 +116,10 @@ for nfe in $nfes; do
   # skipped), so a killed or crashed task costs one retry, not the whole NFE.
   for attempt in 1 2 3; do
     envs_try=$(( envs_now - attempt + 1 > 0 ? envs_now - attempt + 1 : 1 ))
+    if ! gpus_ok; then   # stop here: other jobs take over the checkpoint once this one has ended
+      echo "[fm-rt-eval] a GPU failed its health check $(date); stopping (nvidia-smi below)"; nvidia-smi
+      rm -rf "$LOCKS/$name"; exit 1
+    fi
     echo "=== NFE $nfe attempt $attempt  $(date)$([[ $server = 1 ]] && echo "  envs/GPU=$envs_try")"
     if python experiments/robotwin/run_robotwin_manager.py \
       task=robotwin_unified_flex_3cam_384_1e-4 seed=42 \

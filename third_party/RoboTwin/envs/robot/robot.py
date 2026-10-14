@@ -20,29 +20,52 @@ from .planner import CuroboPlanner
 # the eager build.
 LAZY_CUROBO = os.environ.get("ROBOTWIN_LAZY_CUROBO", "1") != "0"
 
+# The lazily built planners of this process, by their arguments. A planner depends only on the robot
+# (its collision world is a fixed table relative to the robot's mounting pose), so every task env of
+# a process (an eval worker visits many tasks) shares one per arm instead of building its own.
+_CUROBO_PLANNERS = {}
+
+
+class CuroboBuildError(RuntimeError):
+    """Building a cuRobo planner failed: a problem of the process (GPU memory, CUDA state), not of
+    the scene being planned in."""
+
 
 class LazyCuroboPlanner:
-    """A CuroboPlanner built, with the same arguments, the first time it is used. The global random
+    """A CuroboPlanner built, with the same arguments, the first time it is used, and shared with
+    every other LazyCuroboPlanner of the process that has the same arguments. The global random
     states (numpy, random, torch) are restored around the build, so building late leaves every
     random stream as building at setup did (the build consumes none that the scene uses)."""
 
     def __init__(self, *args, **kwargs):
         self._args, self._kwargs, self._planner = args, kwargs, None
 
+    def _key(self):
+        origin_pose, joints_name, all_joints = self._args
+        return (self._kwargs["yml_path"], tuple(np.round(origin_pose.p, 6)), tuple(np.round(origin_pose.q, 6)),
+                tuple(joints_name), tuple(all_joints))
+
     def _get(self):
         if self._planner is None:
-            import random
-            import torch
-            states = (np.random.get_state(), random.getstate(), torch.get_rng_state(),
-                      torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None)
-            try:
-                self._planner = CuroboPlanner(*self._args, **self._kwargs)
-            finally:
-                np.random.set_state(states[0])
-                random.setstate(states[1])
-                torch.set_rng_state(states[2])
-                if states[3] is not None:
-                    torch.cuda.set_rng_state_all(states[3])
+            key = self._key()
+            if key not in _CUROBO_PLANNERS:
+                import random
+                import torch
+                states = (np.random.get_state(), random.getstate(), torch.get_rng_state(),
+                          torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None)
+                try:
+                    _CUROBO_PLANNERS[key] = CuroboPlanner(*self._args, **self._kwargs)
+                    print(f"[cuRobo] built the planner for {os.path.basename(key[0])} "
+                          f"({len(_CUROBO_PLANNERS)} in this process)", flush=True)
+                except Exception as e:
+                    raise CuroboBuildError(f"building the cuRobo planner failed: {e!r}") from e
+                finally:
+                    np.random.set_state(states[0])
+                    random.setstate(states[1])
+                    torch.set_rng_state(states[2])
+                    if states[3] is not None:
+                        torch.cuda.set_rng_state_all(states[3])
+            self._planner = _CUROBO_PLANNERS[key]
         return self._planner
 
     def plan_grippers(self, now_val, target_val):   # linear interpolation, no planner needed

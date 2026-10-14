@@ -8,6 +8,13 @@ class put_object_cabinet(Base_Task):
 
     def setup_demo(self, **kwags):
         super()._init_task_env_(**kwags, table_static=False)
+        # check_success needs them, and a policy rollout runs no play_once: set from this scene (as
+        # play_once does, before it moves anything), not left by the expert demo of another seed.
+        self._set_success_refs()
+
+    def _set_success_refs(self):
+        self.arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
+        self.origin_z = self.object.get_pose().p[2]
 
     def load_actors(self):
         self.model_name = "036_cabinet"
@@ -82,9 +89,8 @@ class put_object_cabinet(Base_Task):
         self.prohibited_area.append([-0.15, -0.3, 0.15, 0.3])
 
     def play_once(self):
-        arm_tag = ArmTag("right" if self.object.get_pose().p[0] > 0 else "left")
-        self.arm_tag = arm_tag
-        self.origin_z = self.object.get_pose().p[2]
+        self._set_success_refs()
+        arm_tag = self.arm_tag
 
         # Grasp the object and grasp the drawer bar
         self.move(self.grasp_actor(self.object, arm_tag=arm_tag, pre_grasp_dis=0.1))
