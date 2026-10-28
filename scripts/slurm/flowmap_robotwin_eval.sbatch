@@ -53,22 +53,35 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false OMP_
 echo "[fm-rt-eval] $(wc -l <<< "$specs") checkpoint(s)  nfes=[$nfes]  tasks=[$tasks]  episodes=$episodes  phases=[$phases]  per_gpu=$per_gpu  policy_server=$server envs_per_gpu=$envs_per_gpu (first NFE: $envs_cold)  rev=$(git rev-parse --short HEAD)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 # Watchdog: a simulator worker whose log has not changed for STALL_MIN minutes is stuck
-# (seen: RoboTwin's expert check looping forever on one seed at 100% CPU). Kill it; the
-# manager then stops and the next attempt resumes. The worker's stdout is a pipe to its
-# parent (eval_robotwin_single.py), which writes the logs: watch the newest log it holds open.
-STALL_MIN="${STALL_MIN:-30}"
-( while sleep 120; do
-    for pid in $(pgrep -u "$USER" -f "script/eval_policy.py"); do
+# (seen: RoboTwin's expert check looping forever on one seed at 100% CPU; a render that never
+# returns, in randomized scenes). Kill it; the manager then stops and the next attempt resumes.
+# The worker's stdout is a pipe to its parent (eval_robotwin_single.py), which writes the logs:
+# watch the newest log it holds open. Its episode log (eval_<task>_<setting>_epNNN.log) names the
+# episode, which is added to the run's .hung_units; workers skip an episode listed twice
+# (script/eval_policy.py), so a render that hangs every time stops ending every attempt.
+# Normal gaps between log lines are under 4 minutes (simulator start-up).
+STALL_MIN="${STALL_MIN:-10}"
+job_sims() {   # this job's simulator workers (a node may hold another job's)
+  local pid
+  for pid in $(pgrep -u "$USER" -f "script/eval_policy.py"); do
+    tr '\0' '\n' < /proc/"$pid"/environ 2>/dev/null | grep -qx "SLURM_JOB_ID=${SLURM_JOB_ID:-}" && echo "$pid"
+  done
+}
+( while sleep 60; do
+    for pid in $(job_sims); do
       ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || continue
-      newest=0
+      newest=0 unit=
       for fd in /proc/"$ppid"/fd/*; do
+        (( ${fd##*/} > 2 )) || continue   # its stdout/stderr are shared with the policy server's
         log=$(readlink "$fd" 2>/dev/null) || continue
         [[ "$log" == *.log && -f "$log" ]] || continue
+        [[ "$(basename "$log")" =~ ^eval_.*_ep[0-9]{3}\.log$ ]] && unit=$log
         m=$(stat -c %Y "$log"); (( m > newest )) && newest=$m
       done
       if (( newest > 0 && $(date +%s) - newest > STALL_MIN * 60 )); then
-        echo "[watchdog] $(date +%T) killing stalled worker $pid (logs unchanged for >${STALL_MIN} min)"
-        kill "$pid"
+        echo "[watchdog] $(date +%T) killing stalled worker $pid (logs unchanged for >${STALL_MIN} min)${unit:+, episode $(basename "$unit" .log)}"
+        [[ -n "$unit" ]] && basename "$unit" .log >> "$(dirname "$unit")/.hung_units"
+        kill -9 "$pid"   # a hung render does not get to handle SIGTERM
       fi
     done
   done ) &
@@ -137,6 +150,10 @@ for nfe in $nfes; do
       EVALUATION.output_dir="evaluate_results/robotwin/_/${name}_nfe${nfe}" < /dev/null; then
       break
     fi
+    # The manager stops eval_robotwin_single.py, not the simulator under it: one stuck in a render
+    # outlives the attempt and holds its GPU memory (later attempts: "OIDN Error: out of memory").
+    left=$(job_sims)
+    [[ -n "$left" ]] && { echo "[fm-rt-eval] killing $(wc -w <<< "$left") leftover simulator(s)"; kill -9 $left 2>/dev/null; sleep 5; }
     echo "[fm-rt-eval] NFE $nfe attempt $attempt failed; resuming"
   done
 done

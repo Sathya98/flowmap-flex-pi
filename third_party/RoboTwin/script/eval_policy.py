@@ -12,7 +12,7 @@ from envs.utils.create_actor import UnStableError
 
 import numpy as np
 from pathlib import Path
-from collections import deque
+from collections import Counter, deque
 import traceback
 
 import json
@@ -269,6 +269,53 @@ _BLACK_PAD_TASKS = ("move_stapler_pad", "place_mouse_pad", "stamp_seal", "place_
 
 def black_pad(task_name, info):
     return task_name in _BLACK_PAD_TASKS and (info or {}).get("{B}") == "Black"
+
+
+# Episodes whose scene hung SAPIEN's ray tracer in nearly every attempt of the 50-task evaluation
+# (2026-10; every model and NFE): (task, task_config, episode). Each is given a fresh seed instead
+# (replacement_seed), the same for every model; the other episodes keep theirs. Episode units only
+# (the policy-server evaluation). ROBOTWIN_ORIGINAL_SEEDS=1 keeps the original seeds (hang tests).
+REPLACED_EPISODES = {("place_shoe", "demo_randomized", 30), ("click_bell", "demo_randomized", 32),
+                     ("place_burger_fries", "demo_randomized", 1)}
+
+
+def scene_textures(args, seed):
+    """(wall, table) background texture ids that _init_task_env_ draws for ``seed`` (None: plain),
+    by replaying its np.random draws: crazy-light flag and the light colours (setup_scene: one
+    directional and two point lights), table height, the two textures, two clean-background draws."""
+    dr = args["domain_randomization"]
+    if not dr.get("random_background", False):
+        return None, None
+    directory = f"./assets/background_texture/{'unseen' if args.get('eval_mode') else 'seen'}"
+    file_count = len([n for n in os.listdir(directory) if os.path.isfile(os.path.join(directory, n))])
+    state = np.random.get_state()
+    try:
+        np.random.seed(seed)
+        if dr.get("random_light", False):
+            for _ in range(1 + 3 * 3):
+                np.random.rand()
+        np.random.uniform(low=-dr.get("random_table_height", 0), high=0)
+        wall, table = np.random.randint(0, file_count), np.random.randint(0, file_count)
+        clean_rate = dr.get("clean_background_rate", 1)
+        if np.random.rand() <= clean_rate:
+            wall = None
+        if np.random.rand() <= clean_rate:
+            table = None
+    finally:
+        np.random.set_state(state)
+    return wall, table
+
+
+def black_texture(args, seed):
+    """Whether a background texture drawn for ``seed`` has a pure-black pixel. SAPIEN's rt shader
+    finds no reflection direction on a surface that reflects nothing and traces a ray with
+    direction (0, 0, 0); on GPUs without RT cores its traversal sometimes never ends."""
+    from PIL import Image
+    directory = f"./assets/background_texture/{'unseen' if args.get('eval_mode') else 'seen'}"
+    for tid in scene_textures(args, seed):
+        if tid is not None and (np.asarray(Image.open(f"{directory}/{tid}.png").convert("RGB")).max(-1) == 0).any():
+            return True
+    return False
 
 
 def expert_check(TASK_ENV, args, now_id, seed, expert_cache):
@@ -586,6 +633,21 @@ def episode_seed(TASK_ENV, args, expert_cache, st_seed, index, lookahead=8):
         seed += 1
 
 
+def replacement_seed(TASK_ENV, args, expert_cache, st_seed, task_name, task_config, index, n_episodes):
+    """(seed, episode_info) for REPLACED_EPISODES episode ``index``: the episode seeds after the
+    first ``n_episodes`` (episode_seed's order) without a pure-black background texture, the j-th
+    for the task's j-th replaced episode, so the evaluated episodes never share a seed."""
+    rank = sorted(i for t, c, i in REPLACED_EPISODES if (t, c) == (task_name, task_config)).index(index)
+    k, found = n_episodes, -1
+    while True:
+        seed, episode_info = episode_seed(TASK_ENV, args, expert_cache, st_seed, k)
+        if not black_texture(args, seed):
+            found += 1
+            if found == rank:
+                return seed, episode_info
+        k += 1
+
+
 _ROLLOUTS = [0]   # rollouts run by this process (renderer cache cleared every clear_cache_freq)
 
 
@@ -617,7 +679,14 @@ def run_episode_unit(usr_args, model, unit, task_envs):
     expert_cache = ExpertCache(usr_args.get("expert_cache_dir"), task_name, task_config, embodiment_name)
     if expert_cache.dir is None:
         raise ValueError("episode units need the shared expert cache (EVALUATION.expert_cache_dir)")
-    seed, episode_info = episode_seed(TASK_ENV, args, expert_cache, 100000 * (1 + usr_args["seed"]), index)
+    st_seed = 100000 * (1 + usr_args["seed"])
+    seed, episode_info = episode_seed(TASK_ENV, args, expert_cache, st_seed, index)
+    replaces = None
+    if (task_name, task_config, index) in REPLACED_EPISODES and os.environ.get("ROBOTWIN_ORIGINAL_SEEDS") != "1":
+        replaces = seed
+        seed, episode_info = replacement_seed(TASK_ENV, args, expert_cache, st_seed, task_name, task_config, index,
+                                              eval_num_episodes)
+        print(f"{task_name} episode {index}: seed {replaces} replaced by {seed} (REPLACED_EPISODES)", flush=True)
     TASK_ENV.test_num = index   # names the eval video and the render log's episode, as in the per-task loop
 
     slots = save_dir / ".video_slots"
@@ -643,7 +712,15 @@ def run_episode_unit(usr_args, model, unit, task_envs):
         raise RuntimeError(f"{task_name} episode {index}: seed {seed} passed its expert check but its "
                            "rollout scene could not be set up")
     result = {"episode": index, "seed": seed, "success": bool(succ), "steps": int(TASK_ENV.take_action_cnt),
-              "instruction": TASK_ENV.get_instruction()}
+              "instruction": TASK_ENV.get_instruction(), **({"replaces_seed": replaces} if replaces is not None else {})}
+    if replaces is not None:   # the replay in scene_textures against what the scene drew
+        try:
+            want = [None if t is None else f"unseen/{t}" for t in scene_textures(args, seed)]
+            got = [TASK_ENV.info["texture_info"][k] for k in ("wall_texture", "table_texture")]
+            print(f"{task_name} episode {index} seed {seed}: textures {got}"
+                  + ("" if want == got else f"; WARNING: scene_textures expected {want}"), flush=True)
+        except Exception as exc:
+            print(f"WARNING: {task_name} episode {index}: texture check failed ({exc!r})", flush=True)
     result_file = Path(unit["result_file"])
     result_file.parent.mkdir(parents=True, exist_ok=True)
     tmp = result_file.with_suffix(f".tmp{os.getpid()}")
@@ -678,12 +755,25 @@ def main(usr_args):
     usr_args["right_arm_dim"] = len(args0["right_embodiment_config"]["arm_joints_name"][1])
     model = get_model(usr_args)
 
+    # Episodes whose render hung: the eval sbatch's watchdog adds the episode's log name to the run's
+    # .hung_units when it kills a stuck worker. One that hung twice hangs again on most tries (in the
+    # 50-task runs: 3 randomized scenes, started 5-9 times in each run), so it is left out instead of
+    # ending every attempt.
+    hung = Counter()
+    if units_file and (Path(units_file).parent / ".hung_units").exists():
+        hung.update((Path(units_file).parent / ".hung_units").read_text().split())
+
     task_envs = {}
     for unit in units:
         name = f"{unit['task_name']} {unit['task_config']}" + (f" {unit['episode']}" if "episode" in unit else "")
         if claim_dir is not None:
             if Path(unit["result_file"]).exists():
                 continue
+            if "episode" in unit:
+                log_name = f"eval_{unit['task_name']}_{unit['task_config'].removeprefix('demo_')}_ep{int(unit['episode']):03d}"
+                if hung[log_name] >= 2:
+                    print(f"skipping {name}: its render hung {hung[log_name]} times", flush=True)
+                    continue
             try:
                 os.mkdir(claim_dir / name.replace(" ", "__"))
             except FileExistsError:
